@@ -1,0 +1,54 @@
+# Donnees et sorties (volumineux, ne pas versionner)
+# Le dossier data/ est versionne (via .gitkeep) mais pas son contenu
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+extract_dataset*/
+rsna_images/
+rsna_output/
+gmic_output/
+cancer_test_output/
+RSNA/
+Test_model_with_cancer/
+
+# PKL orphelins a la racine
+*.pkl
+
+# Fichiers generes par Quarto
+*.html
+pipeline_gmic_files/
+
+# GMIC modeles (trop lourds pour git, a telecharger separement)
+GMIC/models/*.p
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environnements
+.env
+.env.local
+*.kaggle/
+.claude/
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Anciens scripts (gardes en local mais pas dans le package)
+run_gmic_pipeline.py
+run_gmic_rsna.py
+run_gmic_pipeline_with_kaggle_notebook.py
+run_gmic_cancer_test.py
+code_to_extract/
