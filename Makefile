@@ -2,13 +2,16 @@
 ## Usage : make <commande>
 
 .DEFAULT_GOAL := help
-.PHONY: help build setup check validate pull-data preprocess infer notebook notebook-serve run freeze test
+.PHONY: help build setup check validate pull-data preprocess infer notebook notebook-serve run freeze test require-env require-kaggle-env
 
 CONDA_ENV  := gmic
 CONDA_RUN  := conda run -n $(CONDA_ENV) --no-capture-output
 NOTEBOOK      ?= pipeline
 NOTEBOOK_PORT ?= 8080
 NOTEBOOK_KERNEL ?= gmic
+ENV_FILE := .env
+PLACEHOLDER_KAGGLE_USERNAME := votre_username
+PLACEHOLDER_KAGGLE_KEY := votre_api_key
 
 # Charger .env si present
 -include .env
@@ -19,6 +22,25 @@ RESET  := \033[0m
 BOLD   := \033[1m
 GREEN  := \033[32m
 YELLOW := \033[33m
+
+require-env:
+	@if [ ! -f $(ENV_FILE) ]; then \
+		echo "$(YELLOW)Erreur : $(ENV_FILE) manquant.$(RESET)"; \
+		echo "Lancez d'abord : make setup"; \
+		echo "Puis editez $(ENV_FILE) avec vos valeurs."; \
+		exit 1; \
+	fi
+
+require-kaggle-env: require-env
+	@ENV_KAGGLE_USERNAME=$$(grep -E '^KAGGLE_USERNAME=' $(ENV_FILE) | tail -n 1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$$//'); \
+	ENV_KAGGLE_KEY=$$(grep -E '^KAGGLE_KEY=' $(ENV_FILE) | tail -n 1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$$//'); \
+	if [ -z "$$ENV_KAGGLE_USERNAME" ] || [ -z "$$ENV_KAGGLE_KEY" ] || \
+	   [ "$$ENV_KAGGLE_USERNAME" = "$(PLACEHOLDER_KAGGLE_USERNAME)" ] || \
+	   [ "$$ENV_KAGGLE_KEY" = "$(PLACEHOLDER_KAGGLE_KEY)" ]; then \
+		echo "$(YELLOW)Erreur : Kaggle non configure dans .env.$(RESET)"; \
+		echo "Renseignez KAGGLE_USERNAME et KAGGLE_KEY dans .env puis relancez."; \
+		exit 1; \
+	fi
 
 help: ## Affiche cette aide
 	@echo ""
@@ -63,13 +85,17 @@ setup: ## Configurer le projet (variables .env, verifier Kaggle)
 	@echo "Variables de configuration actuelles :"
 	@grep -v '^#' .env | grep -v '^$$' | sed 's/^/  /'
 	@echo ""
-	@if [ -z "$$KAGGLE_USERNAME" ] && [ ! -f ~/.kaggle/kaggle.json ]; then \
-		echo "$(YELLOW)ATTENTION : Kaggle non configure. Editez .env avec KAGGLE_USERNAME et KAGGLE_KEY.$(RESET)"; \
+	@ENV_KAGGLE_USERNAME=$$(grep -E '^KAGGLE_USERNAME=' $(ENV_FILE) | tail -n 1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$$//'); \
+	ENV_KAGGLE_KEY=$$(grep -E '^KAGGLE_KEY=' $(ENV_FILE) | tail -n 1 | cut -d= -f2- | sed 's/^[[:space:]]*//; s/[[:space:]]*$$//'); \
+	if [ -z "$$ENV_KAGGLE_USERNAME" ] || [ -z "$$ENV_KAGGLE_KEY" ] || \
+	   [ "$$ENV_KAGGLE_USERNAME" = "$(PLACEHOLDER_KAGGLE_USERNAME)" ] || \
+	   [ "$$ENV_KAGGLE_KEY" = "$(PLACEHOLDER_KAGGLE_KEY)" ]; then \
+		echo "$(YELLOW)ATTENTION : Kaggle non configure dans .env. Renseignez KAGGLE_USERNAME et KAGGLE_KEY.$(RESET)"; \
 	else \
-		echo "$(GREEN)Kaggle : OK$(RESET)"; \
+		echo "$(GREEN)Kaggle : OK (depuis .env)$(RESET)"; \
 	fi
 
-check: ## Verifier que tout est en place avant de lancer le pipeline
+check: require-env ## Verifier que tout est en place avant de lancer le pipeline
 	@echo "$(YELLOW)Verification de l'environnement...$(RESET)"
 	@echo ""
 	@if conda env list | grep -q "^$(CONDA_ENV) "; then \
@@ -90,7 +116,7 @@ check: ## Verifier que tout est en place avant de lancer le pipeline
 		echo "  $(YELLOW)Dossier data/      : VIDE - lancez : make pull-data$(RESET)"; \
 	fi
 
-validate: ## Valider les donnees d'entree (images, CSV, format)
+validate: require-env ## Valider les donnees d'entree (images, CSV, format)
 	@if [ -z "$(INPUT_DIR)" ]; then \
 		echo "$(YELLOW)Usage : make validate INPUT_DIR=data/demo$(RESET)"; exit 1; \
 	fi
@@ -98,11 +124,11 @@ validate: ## Valider les donnees d'entree (images, CSV, format)
 		--input-dir $(INPUT_DIR) \
 		$(ARGS)
 
-pull-data: ## Telecharger les donnees depuis Kaggle (interactif)
+pull-data: require-kaggle-env ## Telecharger les donnees depuis Kaggle (interactif)
 	@echo "$(YELLOW)Lancement du telechargement Kaggle...$(RESET)"
-	@$(CONDA_RUN) python scripts/extract_download.py
+	@$(CONDA_RUN) python extraction_project/script/extract_download.py
 
-preprocess: ## Lancer uniquement le pretraitement (etapes 1-5)
+preprocess: require-env ## Lancer uniquement le pretraitement (etapes 1-5)
 	@if [ -z "$(INPUT_DIR)" ]; then \
 		echo "$(YELLOW)Erreur : INPUT_DIR non defini.$(RESET)"; \
 		echo "Usage : make preprocess INPUT_DIR=data/demo OUTPUT_DIR=output/demo"; \
@@ -117,7 +143,7 @@ preprocess: ## Lancer uniquement le pretraitement (etapes 1-5)
 		--output-dir $(OUTPUT_DIR) \
 		$(ARGS)
 
-infer: ## Lancer uniquement l'inference (etapes 6-7)
+infer: require-env ## Lancer uniquement l'inference (etapes 6-7)
 	@if [ -z "$(OUTPUT_DIR)" ]; then \
 		echo "$(YELLOW)Erreur : OUTPUT_DIR non defini.$(RESET)"; \
 		echo "Usage : make infer OUTPUT_DIR=output/demo"; \
@@ -130,11 +156,11 @@ infer: ## Lancer uniquement l'inference (etapes 6-7)
 		--output-dir $(OUTPUT_DIR) \
 		$(ARGS)
 
-notebook: ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preprocess]
+notebook: require-env ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preprocess]
 	@QMD=$$(case "$(NOTEBOOK)" in \
 		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
 		test)       echo "notebooks/test_validation_report.qmd" ;; \
-		extract)    echo "notebooks/extract_download.qmd" ;; \
+		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
 		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
 		*)          echo "$(NOTEBOOK)" ;; \
 	esac); \
@@ -156,11 +182,11 @@ notebook: ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preproc
 		--to html --execute --no-execute-daemon; \
 	echo "$(GREEN)Notebook genere : $$HTML$(RESET)"
 
-notebook-serve: ## Re-executer un notebook et le servir en live (quarto preview)  [NOTEBOOK=pipeline|test|...]
+notebook-serve: require-env ## Re-executer un notebook et le servir en live (quarto preview)  [NOTEBOOK=pipeline|test|...]
 	@QMD=$$(case "$(NOTEBOOK)" in \
 		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
 		test)       echo "notebooks/test_validation_report.qmd" ;; \
-		extract)    echo "notebooks/extract_download.qmd" ;; \
+		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
 		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
 		*)          echo "$(NOTEBOOK)" ;; \
 	esac); \
@@ -174,7 +200,7 @@ notebook-serve: ## Re-executer un notebook et le servir en live (quarto preview)
 	echo "$(YELLOW)Re-execution automatique a chaque modification du .qmd$(RESET)"; \
 	QUARTO_PYTHON=$$PYTHON_BIN quarto preview $$QMD --port $(NOTEBOOK_PORT) --no-browser
 
-run: ## Lancer le pipeline complet (DICOM ou PNG auto-detecte)
+run: require-env ## Lancer le pipeline complet (DICOM ou PNG auto-detecte)
 	@if [ -z "$(INPUT_DIR)" ]; then \
 		echo "$(YELLOW)Erreur : INPUT_DIR non defini.$(RESET)"; \
 		echo ""; \
@@ -202,6 +228,6 @@ freeze: ## Exporter l'environnement conda exact (environment.lock.yml)
 	@conda env export -n $(CONDA_ENV) --no-builds > environment.lock.yml
 	@echo "$(GREEN)environment.lock.yml genere.$(RESET)"
 
-test: ## Lancer les tests unitaires (verifie que le code du validateur fonctionne)
+test: require-env ## Lancer les tests unitaires (verifie que le code du validateur fonctionne)
 	@echo "$(YELLOW)Lancement des tests unitaires...$(RESET)"
 	@$(CONDA_RUN) python -m pytest tests/ -v

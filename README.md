@@ -2,6 +2,11 @@
 
 Pipeline de detection du cancer du sein sur mammographies, base sur le modele [GMIC](https://github.com/nyukat/GMIC).
 
+Le projet est maintenant decoupe en deux parties :
+
+- **Pipeline principal GMIC** (preprocess, infer, run, validation, tests) dans `scripts/`.
+- **Extraction Kaggle limitee (<= 1 Go)** deplacee dans `extraction_project/` pour la garder a part.
+
 > Documentation detaillee : [`notebooks/pipeline_gmic.qmd`](notebooks/pipeline_gmic.qmd)
 
 ---
@@ -34,6 +39,8 @@ KAGGLE_USERNAME=votre_username   # depuis kaggle.json → "username"
 KAGGLE_KEY=votre_api_key         # depuis kaggle.json → "key"
 ```
 
+Les commandes `make` refusent de s'executer tant que le fichier `.env` est absent. La commande `make pull-data` exige en plus que `KAGGLE_USERNAME` et `KAGGLE_KEY` soient renseignes (pas les valeurs placeholder).
+
 ---
 
 ## Utilisation
@@ -41,11 +48,17 @@ KAGGLE_KEY=votre_api_key         # depuis kaggle.json → "key"
 Les chemins vers vos donnees sont a preciser a chaque commande via `INPUT_DIR` et `OUTPUT_DIR` :
 
 ```bash
-# Telecharger les images depuis Kaggle
+# (Obligatoire avant pull-data) creer/charger .env
+make setup
+
+# Telecharger un subset Kaggle (code extraction deplace dans extraction_project/, conseille pour petits volumes <= 1 Go)
 make pull-data
 
 # Verifier les donnees avant de lancer (format images, CSV, vues)
 make validate INPUT_DIR=data/demo
+
+# Pipeline complete en une seule commande (preprocess + inference)
+make run INPUT_DIR=data/demo OUTPUT_DIR=output/demo
 
 # Pretraitement des images (etapes 1-5)
 make preprocess INPUT_DIR=data/demo OUTPUT_DIR=output/demo
@@ -53,6 +66,8 @@ make preprocess INPUT_DIR=data/demo OUTPUT_DIR=output/demo
 # Inference GMIC (etapes 6-7)
 make infer OUTPUT_DIR=output/demo
 ```
+
+> `make pull-data` requiert toujours `make setup` au prealable, car les identifiants Kaggle sont lus depuis `.env`.
 
 ---
 
@@ -93,28 +108,32 @@ make notebook-serve NOTEBOOK=test  # rapport en live, se rafraichit a chaque sau
 
 Les notebooks de ce projet sont au format `.qmd` ([Quarto](https://quarto.org)) — un format texte (Markdown + blocs de code Python) qui se rend en HTML interactif.
 
-Deux commandes disponibles selon le besoin :
+### Deux types de notebooks
+
+| Notebook | Type | Ce qu'il fait |
+|---|---|---|
+| `test` | **Executeur** | Lance vraiment `pytest` + `check_image()` a chaque rendu — produit les resultats |
+| `extract` | **Executeur** | Telecharge vraiment les images depuis Kaggle a chaque rendu (notebook deplace dans `extraction_project/notebook/`) |
+| `preprocess` | **Visionneuse** | Lit ce que `make preprocess` a deja produit dans `OUTPUT_DIR` — n'execute rien |
+| `pipeline` | **Visionneuse** | Lit ce que `make infer` a deja produit dans `OUTPUT_DIR` — n'execute rien |
+
+> Les notebooks **visionneuses** (`preprocess`, `pipeline`) ne montrent rien si le dossier `OUTPUT_DIR` est vide. Il faut d'abord lancer le pipeline.
+
+### Commandes
 
 ```bash
 # Generer un HTML statique (pour partager ou archiver)
-make notebook                      # pipeline (defaut)
-make notebook NOTEBOOK=test        # rapport de tests
-make notebook NOTEBOOK=extract     # extraction Kaggle
-make notebook NOTEBOOK=preprocess  # diagnostic pretraitement
+make notebook NOTEBOOK=test                               # rapport de tests (s'execute seul)
+make notebook NOTEBOOK=extract                            # extraction Kaggle (code dans extraction_project/)
+make notebook NOTEBOOK=preprocess OUTPUT_DIR=output/demo  # diagnostic pretraitement (necessite OUTPUT_DIR)
+make notebook NOTEBOOK=pipeline   OUTPUT_DIR=output/demo  # inspection predictions (necessite OUTPUT_DIR)
 
 # Previsualiser en live dans le navigateur (re-execute a chaque sauvegarde du .qmd)
-make notebook-serve                      # pipeline
-make notebook-serve NOTEBOOK=test        # rapport de tests
+make notebook-serve NOTEBOOK=test
+make notebook-serve NOTEBOOK=preprocess OUTPUT_DIR=output/demo
 ```
 
-> `make notebook-serve` utilise `quarto preview` : il re-execute tout le notebook et rafraichit le navigateur automatiquement a chaque modification du fichier `.qmd`. C'est l'equivalent de `make test` mais en visuel.
-
-| Nom court | Fichier | Description |
-|---|---|---|
-| `pipeline` (defaut) | `pipeline_gmic.qmd` | Inspection des sorties : predictions, images croppees |
-| `test` | `test_validation_report.qmd` | Rapport visuel des tests unitaires avec images |
-| `extract` | `extract_download.qmd` | Documentation de l'extraction Kaggle |
-| `preprocess` | `preprocess_gmic.qmd` | Diagnostic du pretraitement |
+> `make notebook-serve` utilise `quarto preview` : il re-execute tout le notebook et rafraichit le navigateur automatiquement a chaque modification du fichier `.qmd`.
 
 > Les fichiers `.html` generes sont ignores par git (voir `.gitignore`). Pour les partager, envoyez directement le `.html` produit.
 
@@ -150,6 +169,7 @@ flowchart LR
 | `make check` | Verifier dependances, modeles GMIC, donnees |
 | `make pull-data` | Telecharger les donnees depuis Kaggle |
 | `make validate` | Valider les donnees d'entree (format, CSV, images) |
+| `make run` | Lancer la pipeline complete GMIC en une seule commande |
 | `make preprocess` | Lancer uniquement le pretraitement (etapes 1-5) |
 | `make infer` | Lancer uniquement l'inference (etapes 6-7) |
 | `make notebook [NOTEBOOK=...]` | Rendre un notebook en HTML (pipeline, test, extract, preprocess) |
@@ -182,17 +202,22 @@ make infer OUTPUT_DIR=output/demo ARGS="--predictions-csv output/demo/preds.csv"
 ├── environment.yml           <- Environnement conda (make build)
 ├── .env.example              <- Copier en .env et remplir
 ├── GMIC/                     <- Modele GMIC (poids dans GMIC/models/)
+├── extraction_project/       <- Projet extraction Kaggle (petits volumes <= 1 Go)
+│   ├── script/
+│   │   └── extract_download.py        <- Telechargement Kaggle (anti-429)
+│   └── notebook/
+│       └── extract_download.qmd       <- Notebook extraction Kaggle
 ├── scripts/
+│   ├── run_gmic_pipeline.py  <- Pipeline complet (make run)
 │   ├── preprocess.py         <- Pretraitement GMIC (etapes 1-5)
 │   ├── inference.py          <- Inference GMIC (etapes 6-7)
-│   ├── extract_download.py   <- Telechargement Kaggle (anti-429)
 │   └── validate_input.py     <- Validation des donnees d'entree
 ├── notebooks/
 │   ├── pipeline_gmic.qmd           <- Inspection des sorties presentes dans output/
-│   ├── extract_download.qmd        <- Documentation de l'extraction
+│   ├── preprocess_gmic.qmd         <- Diagnostic du pretraitement
 │   └── test_validation_report.qmd  <- Rapport de tests avec images
 ├── tests/
-│   └── test_validate_input.py  <- Tests unitaires (CSV, images, vues)
+│   └── test_validate_input.py  <- Tests unitaires (CSV, images)
 ├── doc/
 │   └── troubleshooting.md     <- Erreurs courantes et solutions
 ├── data/                     <- Images + CSV (gitignore, a remplir)

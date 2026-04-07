@@ -312,10 +312,11 @@ def resize_all(cropped_dir: str, pkl_cropped: str):
                 if sfp in scale_map:
                     sh, sw = scale_map[sfp]
                 else:
-                    orig_h = float(wl[2]) if wl and len(wl) == 4 else float(bp[0])
-                    orig_w = float(wl[3]) if wl and len(wl) == 4 else float(rp[1])
-                    sh = GMIC_H / orig_h if orig_h > 0 else 1.0
-                    sw = GMIC_W / orig_w if orig_w > 0 else 1.0
+                    # rightmost_points[1] ≈ largeur crop, bottommost_points[0] ≈ hauteur crop
+                    orig_h = float(bp[0]) if bp[0] > 0 else GMIC_H
+                    orig_w = float(rp[1]) if rp[1] > 0 else GMIC_W
+                    sh = GMIC_H / orig_h
+                    sw = GMIC_W / orig_w
 
                 (ry1, ry2), rx = rp
                 exam["rightmost_points"][view][j] = (
@@ -329,13 +330,9 @@ def resize_all(cropped_dir: str, pkl_cropped: str):
                     (int(round(float(bx1) * sw)), int(round(float(bx2) * sw))),
                 )
 
-                if wl and len(wl) == 4:
-                    exam["window_location"][view][j] = (
-                        int(round(float(wl[0]) * sh)),
-                        int(round(float(wl[1]) * sw)),
-                        GMIC_H,
-                        GMIC_W,
-                    )
+                # window_location = (y_top, y_bottom, x_left, x_right) dans l'image
+                # originale pre-crop — ces coordonnees ne changent pas avec le resize.
+                # On ne modifie pas window_location ici.
 
                 updated += 1
 

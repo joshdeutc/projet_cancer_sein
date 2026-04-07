@@ -34,7 +34,7 @@ VIEWS      = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
 CROP_SIZE  = 256
 
 # OUTPUT_DIR depuis variable d'environnement ou fallback
-raw_param  = os.environ.get("GMIC_OUTPUT_DIR", "output/demo")
+raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or "output/demo"
 OUTPUT_DIR = raw_param if os.path.isabs(raw_param) else os.path.join(PROJECT_DIR, raw_param)
 
 CROPPED_DIR = os.path.join(OUTPUT_DIR, "cropped_images")
@@ -263,15 +263,18 @@ if os.path.isfile(PKL_CROP) and os.path.isfile(PKL_BEFORE) and SOURCE_DIR and os
                 # Dessiner la window_location SUR l'image originale
                 wl = (exam.get("window_location") or {}).get(view, [None])[0]
                 if wl and len(wl) == 4:
-                    wy, wx, wh, ww = int(wl[0]), int(wl[1]), int(wl[2]), int(wl[3])
-                    # Clamper aux bornes de l'image
-                    wx = max(0, min(wx, W_o))
-                    wy = max(0, min(wy, H_o))
-                    rw = min(ww, W_o - wx)
-                    rh = min(wh, H_o - wy)
+                    # window_location = (y_top, y_bottom, x_left, x_right) — coins absolus
+                    y_top, y_bottom, x_left, x_right = (
+                        max(0, min(int(wl[0]), H_o)),
+                        max(0, min(int(wl[1]), H_o)),
+                        max(0, min(int(wl[2]), W_o)),
+                        max(0, min(int(wl[3]), W_o)),
+                    )
+                    rw = x_right - x_left
+                    rh = y_bottom - y_top
                     if rw > 0 and rh > 0:
                         ax_o.add_patch(mpatches.Rectangle(
-                            (wx, wy), rw, rh,
+                            (x_left, y_top), rw, rh,
                             linewidth=2, edgecolor="yellow", facecolor="none",
                             label="Zone croppee"
                         ))
