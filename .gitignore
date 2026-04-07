@@ -46,9 +46,9 @@ uv.lock
 .DS_Store
 Thumbs.db
 
-# Anciens scripts (gardes en local mais pas dans le package)
-run_gmic_pipeline.py
-run_gmic_rsna.py
-run_gmic_pipeline_with_kaggle_notebook.py
-run_gmic_cancer_test.py
-code_to_extract/
+# Anciens scripts racine (gardes en local mais pas dans le package)
+/run_gmic_pipeline.py
+/run_gmic_rsna.py
+/run_gmic_pipeline_with_kaggle_notebook.py
+/run_gmic_cancer_test.py
+/code_to_extract/
