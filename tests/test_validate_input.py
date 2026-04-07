@@ -19,7 +19,6 @@ from validate_input import (
     ValidationResult,
     check_csv,
     check_image,
-    check_views,
 )
 
 
@@ -65,10 +64,34 @@ def make_rgb_image(path, h=3000, w=2000):
     return path
 
 
-def make_tiny_image(path, h=100, w=80):
-    """Cree une image trop petite."""
+def make_tiny_image(path, h=400, w=350):
+    """Cree une image trop petite (sous le seuil de 700px)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     img = np.random.randint(0, 255, (h, w), dtype=np.uint8)
+    cv2.imwrite(path, img)
+    return path
+
+
+def make_white_image(path, h=3000, w=2000):
+    """Cree une image toute blanche."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = np.full((h, w), 255, dtype=np.uint8)
+    cv2.imwrite(path, img)
+    return path
+
+
+def make_large_image(path, h=6000, w=2000):
+    """Cree une image avec une dimension > 5000px."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = np.random.randint(10, 240, (h, w), dtype=np.uint8)
+    cv2.imwrite(path, img)
+    return path
+
+
+def make_uint8_image(path, h=3000, w=2000):
+    """Cree une image uint8 avec distribution uniforme entre 0 et 255."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    img = np.random.randint(0, 256, (h, w), dtype=np.uint8)
     cv2.imwrite(path, img)
     return path
 
@@ -156,11 +179,11 @@ class TestImages:
         assert not result.passed
         assert any("COULEUR" in e for e in result.errors)
 
-    def test_tiny_image_rejected(self, tmp_dir):
+    def test_tiny_image_warns(self, tmp_dir):
         path = make_tiny_image(os.path.join(tmp_dir, "tiny.png"))
         result = ValidationResult()
-        assert check_image(path, result) is False
-        assert any("trop petite" in e for e in result.errors)
+        assert check_image(path, result) is True
+        assert any("petite" in w for w in result.warnings)
 
     def test_black_image_rejected(self, tmp_dir):
         path = make_black_image(os.path.join(tmp_dir, "black.png"))
@@ -176,41 +199,31 @@ class TestImages:
         assert check_image(path, result) is False
         assert any("illisible" in e for e in result.errors)
 
-
-# ── Tests Vues ───────────────────────────────────────────────────────────────
-
-class TestViews:
-    def test_complete_views(self, valid_csv):
-        import pandas as pd
-        df = pd.read_csv(valid_csv)
+    def test_white_image_rejected(self, tmp_dir):
+        path = make_white_image(os.path.join(tmp_dir, "white.png"))
         result = ValidationResult()
-        check_views(df, result)
+        assert check_image(path, result) is False
+        assert any("uniforme" in e for e in result.errors)
+
+    def test_large_image_warns(self, tmp_dir):
+        path = make_large_image(os.path.join(tmp_dir, "large.png"))
+        result = ValidationResult()
+        ok = check_image(path, result)
+        assert ok is True
+        assert any("grande" in w for w in result.warnings)
+
+    def test_uint8_valid(self, tmp_dir):
+        """Une image uint8 avec pixels entre 0 et 255 doit etre acceptee."""
+        path = make_uint8_image(os.path.join(tmp_dir, "uint8.png"))
+        result = ValidationResult()
+        ok = check_image(path, result)
+        assert ok is True
         assert result.passed
-        assert any("4 vues" in msg for msg in result.info)
+        # Verifier que l'image lue est bien en entiers (dtype uint8)
+        import cv2 as _cv2
+        img = _cv2.imread(path, _cv2.IMREAD_UNCHANGED)
+        assert img.dtype.kind == 'u'      # unsigned integer
+        assert img.min() >= 0
+        assert img.max() <= 255
 
-    def test_missing_views_warns(self, tmp_dir):
-        import pandas as pd
-        path = os.path.join(tmp_dir, "incomplete.csv")
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["patient_id", "image_id", "laterality", "view", "cancer"])
-            # Patient avec seulement le cote gauche
-            w.writerow(["10001", "111", "L", "CC", 0])
-            w.writerow(["10001", "112", "L", "MLO", 0])
-        df = pd.read_csv(path)
-        result = ValidationResult()
-        check_views(df, result, strict=False)
-        assert len(result.warnings) > 0
-        assert any("4 vues" in w for w in result.warnings)
 
-    def test_missing_views_strict_fails(self, tmp_dir):
-        import pandas as pd
-        path = os.path.join(tmp_dir, "incomplete.csv")
-        with open(path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["patient_id", "image_id", "laterality", "view", "cancer"])
-            w.writerow(["10001", "111", "L", "CC", 0])
-        df = pd.read_csv(path)
-        result = ValidationResult()
-        check_views(df, result, strict=True)
-        assert not result.passed

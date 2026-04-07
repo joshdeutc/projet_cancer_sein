@@ -6,8 +6,7 @@
 
 CONDA_ENV  := gmic
 CONDA_RUN  := conda run -n $(CONDA_ENV) --no-capture-output
-NOTEBOOK_QMD  ?= notebooks/pipeline_gmic.qmd
-NOTEBOOK_HTML ?= notebooks/pipeline_gmic.html
+NOTEBOOK      ?= pipeline
 NOTEBOOK_PORT ?= 8080
 NOTEBOOK_KERNEL ?= gmic
 
@@ -131,43 +130,49 @@ infer: ## Lancer uniquement l'inference (etapes 6-7)
 		--output-dir $(OUTPUT_DIR) \
 		$(ARGS)
 
-notebook: ## Executer et rendre le notebook de resultats en HTML
-	@if ! command -v quarto >/dev/null 2>&1; then \
-		echo "$(YELLOW)Quarto introuvable. Installez-le : https://quarto.org/docs/get-started/$(RESET)"; \
-		exit 1; \
-	fi
-	@if [ ! -f "$(NOTEBOOK_QMD)" ]; then \
-		echo "$(YELLOW)Notebook introuvable : $(NOTEBOOK_QMD)$(RESET)"; \
-		exit 1; \
-	fi
-	@echo "$(YELLOW)Verification du kernel Jupyter '$(NOTEBOOK_KERNEL)'...$(RESET)"
-	@$(CONDA_RUN) python -c "import ipykernel, nbformat" >/dev/null 2>&1 || { \
-		echo "Installation de ipykernel + nbformat dans l'environnement $(CONDA_ENV)..."; \
+notebook: ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preprocess]
+	@QMD=$$(case "$(NOTEBOOK)" in \
+		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
+		test)       echo "notebooks/test_validation_report.qmd" ;; \
+		extract)    echo "notebooks/extract_download.qmd" ;; \
+		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
+		*)          echo "$(NOTEBOOK)" ;; \
+	esac); \
+	HTML=$${QMD%.qmd}.html; \
+	if ! command -v quarto >/dev/null 2>&1; then \
+		echo "$(YELLOW)Quarto introuvable. Installez-le : https://quarto.org/docs/get-started/$(RESET)"; exit 1; \
+	fi; \
+	if [ ! -f "$$QMD" ]; then \
+		echo "$(YELLOW)Notebook introuvable : $$QMD$(RESET)"; \
+		echo "Valeurs acceptees : pipeline, test, extract, preprocess (ou chemin direct)"; exit 1; \
+	fi; \
+	$(CONDA_RUN) python -c "import ipykernel, nbformat" >/dev/null 2>&1 || \
 		$(CONDA_RUN) python -m pip install -q ipykernel nbformat; \
-	}
-	@$(CONDA_RUN) python -m ipykernel install --user --name $(NOTEBOOK_KERNEL) --display-name "Python ($(CONDA_ENV))" >/dev/null
-	@echo "$(YELLOW)Execution + rendu du notebook...$(RESET)"
-	@echo "  NOTEBOOK_QMD  = $(NOTEBOOK_QMD)"
-	@echo "  NOTEBOOK_HTML = $(NOTEBOOK_HTML)"
-	@GMIC_OUTPUT_DIR=$(OUTPUT_DIR) $(CONDA_RUN) quarto render $(NOTEBOOK_QMD) \
-		--to html --execute --no-execute-daemon
-	@echo "$(GREEN)Notebook genere : $(NOTEBOOK_HTML)$(RESET)"
+	$(CONDA_RUN) python -m ipykernel install --user --name $(NOTEBOOK_KERNEL) \
+		--display-name "Python ($(CONDA_ENV))" >/dev/null; \
+	PYTHON_BIN=$$(conda run -n $(CONDA_ENV) python -c "import sys; print(sys.executable)"); \
+	echo "$(YELLOW)Rendu du notebook : $$QMD$(RESET)"; \
+	GMIC_OUTPUT_DIR=$(OUTPUT_DIR) QUARTO_PYTHON=$$PYTHON_BIN quarto render $$QMD \
+		--to html --execute --no-execute-daemon; \
+	echo "$(GREEN)Notebook genere : $$HTML$(RESET)"
 
-notebook-preprocess: ## Notebook de diagnostic pretraitement (OUTPUT_DIR=output/demo)
-	@$(CONDA_RUN) python -m ipykernel install --user --name $(NOTEBOOK_KERNEL) --display-name "Python ($(CONDA_ENV))" >/dev/null
-	@echo "$(YELLOW)Rendu du notebook pretraitement (OUTPUT_DIR=$(OUTPUT_DIR))...$(RESET)"
-	@GMIC_OUTPUT_DIR=$(OUTPUT_DIR) $(CONDA_RUN) quarto render notebooks/preprocess_gmic.qmd \
-		--to html --execute --no-execute-daemon
-	@echo "$(GREEN)Notebook genere : notebooks/preprocess_gmic.html$(RESET)"
-
-notebook-serve: ## Servir le notebook HTML (http://localhost:8080)
-	@if [ ! -f "$(NOTEBOOK_HTML)" ]; then \
-		echo "$(YELLOW)HTML introuvable : $(NOTEBOOK_HTML). Lancez d'abord 'make notebook'.$(RESET)"; \
-		exit 1; \
-	fi
-	@echo "$(YELLOW)Serveur local du notebook$(RESET)"
-	@echo "  URL : http://localhost:$(NOTEBOOK_PORT)/$(NOTEBOOK_HTML)"
-	@python -m http.server $(NOTEBOOK_PORT)
+notebook-serve: ## Re-executer un notebook et le servir en live (quarto preview)  [NOTEBOOK=pipeline|test|...]
+	@QMD=$$(case "$(NOTEBOOK)" in \
+		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
+		test)       echo "notebooks/test_validation_report.qmd" ;; \
+		extract)    echo "notebooks/extract_download.qmd" ;; \
+		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
+		*)          echo "$(NOTEBOOK)" ;; \
+	esac); \
+	if [ ! -f "$$QMD" ]; then \
+		echo "$(YELLOW)Notebook introuvable : $$QMD$(RESET)"; exit 1; \
+	fi; \
+	$(CONDA_RUN) python -m ipykernel install --user --name $(NOTEBOOK_KERNEL) \
+		--display-name "Python ($(CONDA_ENV))" >/dev/null; \
+	PYTHON_BIN=$$(conda run -n $(CONDA_ENV) python -c "import sys; print(sys.executable)"); \
+	echo "$(YELLOW)Ouvrez dans votre navigateur : http://localhost:$(NOTEBOOK_PORT)/$(RESET)"; \
+	echo "$(YELLOW)Re-execution automatique a chaque modification du .qmd$(RESET)"; \
+	QUARTO_PYTHON=$$PYTHON_BIN quarto preview $$QMD --port $(NOTEBOOK_PORT) --no-browser
 
 run: ## Lancer le pipeline complet (DICOM ou PNG auto-detecte)
 	@if [ -z "$(INPUT_DIR)" ]; then \
@@ -197,6 +202,6 @@ freeze: ## Exporter l'environnement conda exact (environment.lock.yml)
 	@conda env export -n $(CONDA_ENV) --no-builds > environment.lock.yml
 	@echo "$(GREEN)environment.lock.yml genere.$(RESET)"
 
-test: ## Lancer les tests unitaires
-	@echo "$(YELLOW)Lancement des tests...$(RESET)"
+test: ## Lancer les tests unitaires (verifie que le code du validateur fonctionne)
+	@echo "$(YELLOW)Lancement des tests unitaires...$(RESET)"
 	@$(CONDA_RUN) python -m pytest tests/ -v

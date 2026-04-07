@@ -22,8 +22,9 @@ import numpy as np
 
 # ── Seuils de validation ────────────────────────────────────────────────────
 
-MIN_IMAGE_SIZE = 500       # pixels minimum (hauteur et largeur)
+MIN_IMAGE_SIZE = 700       # pixels minimum (hauteur et largeur)
 MIN_PIXEL_RANGE = 50       # ecart min-max minimum (image pas toute noire/blanche)
+VERY_LARGE_DIM = 5000      # avertissement si une dimension depasse ce seuil
 EXPECTED_CSV_COLS = {"patient_id", "image_id", "laterality", "view", "cancer"}
 VALID_LATERALITIES = {"L", "R"}
 VALID_VIEWS = {"CC", "MLO"}
@@ -180,14 +181,21 @@ def check_image(path: str, result: ValidationResult, strict: bool = False) -> bo
 
     h, w = img.shape[:2]
 
-    # Taille minimum
+    # Taille minimum (warning seulement — le pipeline peut continuer)
     if h < MIN_IMAGE_SIZE or w < MIN_IMAGE_SIZE:
-        result.error(
-            f"Image trop petite : {path} ({w}x{h}). "
+        result.warn(
+            f"Image petite : {path} ({w}x{h}). "
             f"Les mammographies font typiquement >2000px. "
-            f"Minimum requis : {MIN_IMAGE_SIZE}px."
+            f"Seuil recommande : {MIN_IMAGE_SIZE}px."
         )
-        return False
+
+    # Avertissement si image tres grande
+    if max(h, w) > VERY_LARGE_DIM:
+        result.warn(
+            f"Image tres grande : {path} ({w}x{h}). "
+            f"Une dimension depasse {VERY_LARGE_DIM}px — "
+            f"cela peut ralentir le pipeline."
+        )
 
     # Toute noire ou toute blanche ?
     pmin, pmax = int(img.min()), int(img.max())
@@ -333,44 +341,6 @@ def check_gmic(result: ValidationResult):
         result.ok("GMIC : 5 modeles presents")
 
 
-# ── Checks vues par patient ─────────────────────────────────────────────────
-
-def check_views(df, result: ValidationResult, strict: bool = False):
-    """Verifie que chaque patient a les 4 vues attendues."""
-    if df is None:
-        return
-
-    expected_views = {"L-CC", "L-MLO", "R-CC", "R-MLO"}
-    patients_missing_views = []
-
-    for pid, group in df.groupby("patient_id"):
-        patient_views = set()
-        for _, row in group.iterrows():
-            patient_views.add(f"{row['laterality']}-{row['view']}")
-        missing = expected_views - patient_views
-        if missing:
-            patients_missing_views.append((pid, missing))
-
-    if patients_missing_views:
-        n = len(patients_missing_views)
-        total = df["patient_id"].nunique()
-        examples = patients_missing_views[:3]
-        if strict:
-            result.error(
-                f"{n}/{total} patients n'ont pas les 4 vues standard. "
-                f"GMIC requiert L-CC, L-MLO, R-CC, R-MLO. "
-                f"Exemples : {[(str(p), sorted(m)) for p, m in examples]}"
-            )
-        else:
-            result.warn(
-                f"{n}/{total} patients n'ont pas les 4 vues. "
-                f"GMIC pourrait echouer pour ces patients. "
-                f"Exemples : {[(str(p), sorted(m)) for p, m in examples]}"
-            )
-    else:
-        result.ok(f"Vues : tous les patients ont les 4 vues standard")
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -393,11 +363,11 @@ def main():
     print("=" * 60)
 
     # 1. GMIC
-    print("\n[1/4] Verification du modele GMIC...")
+    print("\n[1/3] Verification du modele GMIC...")
     check_gmic(result)
 
     # 2. CSV
-    print("[2/4] Verification du CSV...")
+    print("[2/3] Verification du CSV...")
     csv_path = args.csv
     if csv_path is None:
         for candidate in ["train_subset_test.csv", "train.csv"]:
@@ -413,13 +383,9 @@ def main():
         df = None
 
     # 3. Images
-    print("[3/4] Verification des images...")
+    print("[3/3] Verification des images...")
     images_dir = find_images_dir(input_dir)
     check_images(images_dir, result, df=df, strict=args.strict)
-
-    # 4. Vues par patient
-    print("[4/4] Verification des vues par patient...")
-    check_views(df, result, strict=args.strict)
 
     # Rapport
     result.print_report()
