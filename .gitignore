@@ -1,7 +1,8 @@
 # Donnees et sorties (volumineux, ne pas versionner)
-# Le dossier data/ est versionne (via .gitkeep) mais pas son contenu
 data/*
 !data/.gitkeep
+!data/sample/
+!data/test_images/
 output/*
 !output/.gitkeep
 extract_dataset*/
@@ -15,8 +16,9 @@ Test_model_with_cancer/
 # PKL orphelins a la racine
 *.pkl
 
-# Fichiers generes par Quarto
-*.html
+# Fichiers generes par Quarto (les rapports HTML de reference sont dans docs/)
+script_notebook/*.html
+script_notebook/*.pdf
 pipeline_gmic_files/
 
 # GMIC modeles (trop lourds pour git, a telecharger separement)

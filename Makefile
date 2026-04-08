@@ -69,6 +69,10 @@ build: ## Creer l'environnement conda 'gmic' depuis environment.yml
 	else \
 		conda env create -f environment.yml; \
 	fi
+	@echo "$(YELLOW)Installation de PyTorch avec support CUDA 12.8...$(RESET)"
+	@conda run -n $(CONDA_ENV) pip install --quiet \
+		"torch==2.11.0+cu128" "torchvision==0.26.0+cu128" \
+		--index-url https://download.pytorch.org/whl/cu128
 	@echo ""
 	@echo "$(GREEN)Environnement pret.$(RESET)"
 	@echo "$(YELLOW)Activez-le avec : conda activate $(CONDA_ENV)$(RESET)"
@@ -158,10 +162,10 @@ infer: require-env ## Lancer uniquement l'inference (etapes 6-7)
 
 notebook: require-env ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preprocess]
 	@QMD=$$(case "$(NOTEBOOK)" in \
-		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
-		test)       echo "notebooks/test_validation_report.qmd" ;; \
+		pipeline)   echo "script_notebook/pipeline_gmic.qmd" ;; \
+		test)       echo "script_notebook/test_validation_report.qmd" ;; \
 		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
-		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
+		preprocess) echo "script_notebook/preprocess_gmic.qmd" ;; \
 		*)          echo "$(NOTEBOOK)" ;; \
 	esac); \
 	HTML=$${QMD%.qmd}.html; \
@@ -184,10 +188,10 @@ notebook: require-env ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|ext
 
 notebook-serve: require-env ## Re-executer un notebook et le servir en live (quarto preview)  [NOTEBOOK=pipeline|test|...]
 	@QMD=$$(case "$(NOTEBOOK)" in \
-		pipeline)   echo "notebooks/pipeline_gmic.qmd" ;; \
-		test)       echo "notebooks/test_validation_report.qmd" ;; \
+		pipeline)   echo "script_notebook/pipeline_gmic.qmd" ;; \
+		test)       echo "script_notebook/test_validation_report.qmd" ;; \
 		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
-		preprocess) echo "notebooks/preprocess_gmic.qmd" ;; \
+		preprocess) echo "script_notebook/preprocess_gmic.qmd" ;; \
 		*)          echo "$(NOTEBOOK)" ;; \
 	esac); \
 	if [ ! -f "$$QMD" ]; then \

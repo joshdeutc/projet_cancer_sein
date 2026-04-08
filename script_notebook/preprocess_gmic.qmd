@@ -1,0 +1,458 @@
+---
+title: "Prétraitement GMIC — Rapport de run"
+subtitle: "Diagnostic visuel des sorties de preprocess.py"
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+jupyter: gmic
+---
+
+```{python}
+#| echo: false
+import os, glob, pickle, sys, re, textwrap
+import cv2, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, matplotlib.patches as mpatches
+from IPython.display import Markdown, display as ipy_display
+
+def _find_root(start):
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, "scripts")) and os.path.isdir(os.path.join(cur, "GMIC")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+PROJECT_DIR = _find_root(os.getcwd())
+sys.path.insert(0, os.path.join(PROJECT_DIR, "GMIC"))
+
+GMIC_H, GMIC_W = 2944, 1920
+VIEWS      = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
+CROP_SIZE  = 256
+
+# OUTPUT_DIR depuis variable d'environnement ou fallback
+raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or "output/demo"
+OUTPUT_DIR = raw_param if os.path.isabs(raw_param) else os.path.join(PROJECT_DIR, raw_param)
+
+CROPPED_DIR = os.path.join(OUTPUT_DIR, "cropped_images")
+PKL_BEFORE  = os.path.join(OUTPUT_DIR, "exam_list_before_cropping.pkl")
+PKL_CROP    = os.path.join(OUTPUT_DIR, "cropped_exam_list.pkl")
+PKL_FINAL   = os.path.join(OUTPUT_DIR, "data.pkl")
+SOURCE_FILE = os.path.join(OUTPUT_DIR, "source_dir.txt")
+SOURCE_DIR  = open(SOURCE_FILE).read().strip() if os.path.isfile(SOURCE_FILE) else None
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def load_u8(path):
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    f = img.astype(np.float32); m = f.max()
+    return (f / m * 255).astype(np.uint8) if m > 0 else np.zeros_like(f, dtype=np.uint8)
+
+def first_pid(exam):
+    return next((exam[v][0].split("/")[0] for v in VIEWS if exam.get(v)), "?")
+
+# ── Extraction de fonctions depuis preprocess.py ─────────────────────────────
+
+SCRIPT_PATH = os.path.join(PROJECT_DIR, "scripts", "preprocess.py")
+with open(SCRIPT_PATH) as _f:
+    SCRIPT_SRC = _f.read()
+
+def extract_func(name):
+    """Extrait le code source d'une fonction depuis le script."""
+    pattern = rf'^(def {name}\(.*?)(?=\ndef |\nclass |\n# ── |\Z)'
+    m = re.search(pattern, SCRIPT_SRC, re.MULTILINE | re.DOTALL)
+    return m.group(1).rstrip() if m else f"# Fonction {name} non trouvée"
+
+def show_func(name):
+    """Affiche le code source d'une fonction dans un bloc Python."""
+    code = extract_func(name)
+    ipy_display(Markdown(f"```python\n{code}\n```"))
+```
+
+## Dossier analysé
+
+```{python}
+#| echo: false
+rel = os.path.relpath(OUTPUT_DIR, PROJECT_DIR)
+rows = []
+for label, path in [
+    ("exam_list_before_cropping.pkl", PKL_BEFORE),
+    ("cropped_exam_list.pkl",         PKL_CROP),
+    ("data.pkl",                      PKL_FINAL),
+    ("source_dir.txt",                SOURCE_FILE),
+    ("cropped_images/",               CROPPED_DIR),
+]:
+    exists = os.path.isfile(path) or os.path.isdir(path)
+    rows.append({"Fichier": label, "Statut": "OK" if exists else "absent"})
+
+ipy_display(Markdown(f"**Run** : `{rel}`\n"))
+ipy_display(pd.DataFrame(rows).set_index("Fichier"))
+```
+
+---
+
+## Étape 1 — Conversion DICOM → PNG
+
+> Extrait les pixels DICOM, corrige l'inversion MONOCHROME1, et sauvegarde en PNG 16-bit.
+
+```{python}
+#| echo: false
+show_func("convert_dcm_to_png")
+```
+
+```{python}
+#| echo: false
+if not os.path.isfile(PKL_BEFORE):
+    print("exam_list_before_cropping.pkl absent — étape non terminée.")
+else:
+    with open(PKL_BEFORE, "rb") as f:
+        exams_before = pickle.load(f)
+
+    complete = [e for e in exams_before if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    n_cancer = sum(1 for e in exams_before if e["cancer_label"]["malignant"])
+    n_imgs   = sum(len(e.get(v,[])) for e in exams_before for v in VIEWS)
+
+    summary = pd.DataFrame([
+        {"Métrique": "Examens total",             "Valeur": len(exams_before)},
+        {"Métrique": "Examens complets (4 vues)", "Valeur": len(complete)},
+        {"Métrique": "Cancer",                    "Valeur": n_cancer},
+        {"Métrique": "Sains",                     "Valeur": len(exams_before) - n_cancer},
+        {"Métrique": "Images référencées",        "Valeur": n_imgs},
+    ])
+    ipy_display(summary.set_index("Métrique"))
+
+    incomplete = [(e, [v for v in VIEWS if not e.get(v)])
+                  for e in exams_before if not all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    if incomplete:
+        ipy_display(Markdown(f"\n**{len(incomplete)} examens incomplets :**\n"))
+        rows_inc = [{"Patient": first_pid(e), "Vues manquantes": ", ".join(m)}
+                    for e, m in incomplete[:15]]
+        ipy_display(pd.DataFrame(rows_inc))
+    else:
+        print("Tous les examens ont les 4 vues.")
+```
+
+### Aperçu des images converties
+
+```{python}
+#| echo: false
+if os.path.isfile(PKL_BEFORE) and SOURCE_DIR and os.path.isdir(SOURCE_DIR):
+    show = {}
+    for e in complete:
+        lbl = "Cancer" if e["cancer_label"]["malignant"] else "Sain"
+        if lbl not in show: show[lbl] = e
+        if len(show) == 2: break
+
+    for lbl, exam in show.items():
+        pid = first_pid(exam)
+        fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+        fig.suptitle(f"Patient {lbl} ({pid}) — Images PNG source", fontsize=11, fontweight="bold")
+        for ax, view in zip(axes, VIEWS):
+            imgs = exam.get(view, [])
+            if imgs:
+                iid = imgs[0].split("/")[1]
+                img = load_u8(os.path.join(SOURCE_DIR, pid, iid + ".png"))
+                if img is not None:
+                    ax.imshow(img, cmap="gray")
+                    ax.set_title(f"{view}\n{img.shape[1]}x{img.shape[0]}", fontsize=9)
+                else:
+                    ax.text(0.5, 0.5, "Fichier absent", ha="center", va="center",
+                            transform=ax.transAxes, fontsize=8)
+            else:
+                ax.text(0.5, 0.5, "Vue absente", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=9)
+            ax.axis("off")
+        plt.tight_layout(); plt.show()
+elif not SOURCE_DIR:
+    print("source_dir.txt absent — images sources non disponibles.")
+```
+
+---
+
+## Étape 2 — Construction du PKL
+
+> Construit le fichier pickle au format attendu par GMIC : une liste d'examens avec 4 vues et les labels cancer.
+
+```{python}
+#| echo: false
+show_func("build_exam_pkl")
+```
+
+---
+
+## Étape 3 — Recadrage (`crop_mammogram`)
+
+> Détecte le tissu mammaire et supprime le fond noir. Produit les images croppées
+> et un nouveau PKL enrichi (`window_location`, `rightmost_points`, etc.).
+
+```{python}
+#| echo: false
+show_func("run_crop")
+```
+
+```{python}
+#| echo: false
+if not os.path.isfile(PKL_CROP):
+    print("cropped_exam_list.pkl absent.")
+else:
+    with open(PKL_CROP, "rb") as f:
+        exams_crop = pickle.load(f)
+    n_png = len(glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True))
+    n_ref = sum(len(e.get(v,[])) for e in exams_crop for v in VIEWS)
+
+    pngs_sample = glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True)[:50]
+    sizes = []
+    for p in pngs_sample:
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            sizes.append(img.shape[:2])
+    hs = [s[0] for s in sizes]; ws = [s[1] for s in sizes]
+
+    summary = pd.DataFrame([
+        {"Métrique": "Images PNG sur disque",        "Valeur": n_png},
+        {"Métrique": "Images ref. dans le PKL",      "Valeur": n_ref},
+        {"Métrique": "Hauteur min - max (px)",       "Valeur": f"{min(hs)} - {max(hs)}" if hs else "-"},
+        {"Métrique": "Largeur min - max (px)",       "Valeur": f"{min(ws)} - {max(ws)}" if ws else "-"},
+    ])
+    ipy_display(summary.set_index("Métrique"))
+```
+
+### Avant / après recadrage
+
+> La `window_location` (rectangle jaune) indique la zone extraite de l'image originale par `crop_mammogram`.
+
+```{python}
+#| echo: false
+if os.path.isfile(PKL_CROP) and os.path.isfile(PKL_BEFORE) and SOURCE_DIR and os.path.isdir(SOURCE_DIR):
+    # Patients de démonstration
+    show_crop = {}
+    crop_complete = [e for e in exams_crop if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    for e in crop_complete:
+        lbl = "Cancer" if e["cancer_label"]["malignant"] else "Sain"
+        if lbl not in show_crop: show_crop[lbl] = e
+        if len(show_crop) == 2: break
+
+    for lbl, exam in show_crop.items():
+        pid = first_pid(exam)
+
+        fig, axes = plt.subplots(2, 4, figsize=(18, 11))
+        fig.suptitle(f"Patient {lbl} ({pid}) — Avant / Apres recadrage",
+                     fontsize=11, fontweight="bold")
+
+        for col, view in enumerate(VIEWS):
+            imgs = exam.get(view, [])
+            sfp  = imgs[0] if imgs else None
+            iid  = sfp.split("/")[1] if sfp else None
+
+            # ── Ligne 0 : image originale avec window_location en jaune ──
+            ax_o = axes[0][col]
+            if iid and SOURCE_DIR:
+                img_o = load_u8(os.path.join(SOURCE_DIR, pid, iid + ".png"))
+            else:
+                img_o = None
+
+            if img_o is not None:
+                ax_o.imshow(img_o, cmap="gray")
+                H_o, W_o = img_o.shape[:2]
+
+                # Dessiner la window_location SUR l'image originale
+                wl = (exam.get("window_location") or {}).get(view, [None])[0]
+                if wl and len(wl) == 4:
+                    # window_location = (y_top, y_bottom, x_left, x_right) — coins absolus
+                    y_top, y_bottom, x_left, x_right = (
+                        max(0, min(int(wl[0]), H_o)),
+                        max(0, min(int(wl[1]), H_o)),
+                        max(0, min(int(wl[2]), W_o)),
+                        max(0, min(int(wl[3]), W_o)),
+                    )
+                    rw = x_right - x_left
+                    rh = y_bottom - y_top
+                    if rw > 0 and rh > 0:
+                        ax_o.add_patch(mpatches.Rectangle(
+                            (x_left, y_top), rw, rh,
+                            linewidth=2, edgecolor="yellow", facecolor="none",
+                            label="Zone croppee"
+                        ))
+                        ax_o.legend(fontsize=7, loc="lower right")
+
+                ax_o.set_title(f"{view} — Original\n{W_o}x{H_o}", fontsize=9)
+            else:
+                ax_o.text(0.5, 0.5, "Image absente", ha="center", va="center",
+                          transform=ax_o.transAxes)
+            ax_o.axis("off")
+
+            # ── Ligne 1 : image croppee ──
+            ax_c = axes[1][col]
+            if sfp:
+                img_c = load_u8(os.path.join(CROPPED_DIR, sfp + ".png"))
+                if img_c is not None:
+                    ax_c.imshow(img_c, cmap="gray")
+                    ax_c.set_title(f"Croppee\n{img_c.shape[1]}x{img_c.shape[0]}", fontsize=9)
+                else:
+                    ax_c.text(0.5, 0.5, "Absent", ha="center", va="center",
+                              transform=ax_c.transAxes)
+            ax_c.axis("off")
+
+        axes[0][0].set_ylabel("Original", fontsize=11, labelpad=10)
+        axes[1][0].set_ylabel("Recadree", fontsize=11, labelpad=10)
+        plt.tight_layout(); plt.show()
+elif not SOURCE_DIR:
+    print("source_dir.txt absent — comparaison avant/apres impossible.")
+```
+
+---
+
+## Étape 4 — Resize 2944x1920 + normalisation
+
+> Toutes les images croppees sont redimensionnees a exactement 2944x1920 pixels
+> et normalisees en uint8 [0, 255] pour l'inference GMIC.
+
+```{python}
+#| echo: false
+show_func("resize_all")
+```
+
+```{python}
+#| echo: false
+pngs_all = glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True)
+sample   = pngs_all[:min(40, len(pngs_all))]
+bad_size, bad_dtype = [], []
+for p in sample:
+    img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+    if img is None: continue
+    h, w = img.shape[:2]
+    if h != GMIC_H or w != GMIC_W:
+        bad_size.append(os.path.relpath(p, OUTPUT_DIR))
+    if img.dtype != np.uint8:
+        bad_dtype.append(os.path.relpath(p, OUTPUT_DIR))
+
+summary = pd.DataFrame([
+    {"Verification": f"Images echantillonnees",          "Resultat": len(sample)},
+    {"Verification": f"Taille != {GMIC_W}x{GMIC_H}",   "Resultat": len(bad_size) or "OK"},
+    {"Verification": "dtype != uint8",                    "Resultat": len(bad_dtype) or "OK"},
+])
+ipy_display(summary.set_index("Verification"))
+```
+
+---
+
+## Étape 5 — Centres optimaux (`get_optimal_centers`)
+
+> Calcule le `best_center` pour chaque image : le point optimal autour duquel la branche
+> locale de GMIC va extraire ses K=6 patches de 256x256 pixels pendant l'inference.
+
+```{python}
+#| echo: false
+show_func("run_optimal_centers")
+```
+
+```{python}
+#| echo: false
+if not os.path.isfile(PKL_FINAL):
+    print("data.pkl absent — étape non terminée.")
+else:
+    with open(PKL_FINAL, "rb") as f:
+        exams_final = pickle.load(f)
+    complete_f = [e for e in exams_final if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    n_has_bc   = sum(1 for e in complete_f if e.get("best_center"))
+    print(f"Examens complets avec best_center : {n_has_bc}/{len(complete_f)}")
+```
+
+### Visualisation des centres
+
+> La croix **rouge** = `best_center`.
+> Le rectangle **cyan** = patch local 256x256 que GMIC utilise pour son attention locale.
+
+```{python}
+#| echo: false
+if os.path.isfile(PKL_FINAL):
+    show_final = {}
+    for e in complete_f:
+        lbl = "Cancer" if e["cancer_label"]["malignant"] else "Sain"
+        if lbl not in show_final: show_final[lbl] = e
+        if len(show_final) == 2: break
+
+    for lbl, exam in show_final.items():
+        pid = first_pid(exam)
+        cols_data = [(v, exam[v]) for v in VIEWS if exam.get(v)]
+        n_cols = len(cols_data)
+
+        fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 8))
+        if n_cols == 1: axes = [axes]
+        fig.suptitle(
+            f"Patient {lbl} ({pid}) — Centres optimaux GMIC",
+            fontsize=11, fontweight="bold"
+        )
+
+        for ax, (view, imgs) in zip(axes, cols_data):
+            sfp = imgs[0]
+            img = load_u8(os.path.join(CROPPED_DIR, sfp + ".png"))
+            if img is None:
+                ax.text(0.5, 0.5, "Image manquante", ha="center", va="center",
+                        transform=ax.transAxes); ax.axis("off"); continue
+
+            H, W = img.shape[:2]
+            ax.imshow(img, cmap="gray", aspect="auto")
+
+            centers = (exam.get("best_center") or {}).get(view, [])
+            if centers:
+                cy, cx = int(centers[0][0]), int(centers[0][1])
+                ax.plot(cx, cy, "r+", markersize=22, markeredgewidth=2.5, label="best_center")
+
+                half = CROP_SIZE // 2
+                rx0, ry0 = max(0, cx - half), max(0, cy - half)
+                ax.add_patch(mpatches.Rectangle(
+                    (rx0, ry0), min(CROP_SIZE, W - rx0), min(CROP_SIZE, H - ry0),
+                    linewidth=2, edgecolor="cyan", facecolor="none",
+                    label=f"Patch local {CROP_SIZE}x{CROP_SIZE}"
+                ))
+                ax.set_title(f"{view}\ncenter=({cx}, {cy})", fontsize=9)
+                ax.legend(fontsize=7, loc="lower right")
+            else:
+                ax.set_title(f"{view}\n(best_center absent)", fontsize=9)
+            ax.axis("off")
+
+        plt.tight_layout(); plt.show()
+```
+
+---
+
+## Récapitulatif
+
+```{python}
+#| echo: false
+rows = []
+for step, pkl_path, label in [
+    ("Apres conversion",       PKL_BEFORE, "exam_list_before_cropping.pkl"),
+    ("Apres crop",             PKL_CROP,   "cropped_exam_list.pkl"),
+    ("Apres resize + centers", PKL_FINAL,  "data.pkl"),
+]:
+    if not os.path.isfile(pkl_path):
+        rows.append({"Etape": step, "Fichier": label, "Examens": "-", "Complets": "-", "Images": "-"})
+        continue
+    with open(pkl_path, "rb") as f:
+        exs = pickle.load(f)
+    rows.append({
+        "Etape":    step,
+        "Fichier":  label,
+        "Examens":  len(exs),
+        "Complets": sum(1 for e in exs if all(len(e.get(v,[])) > 0 for v in VIEWS)),
+        "Images":   sum(len(e.get(v,[])) for e in exs for v in VIEWS),
+    })
+n_png = len(glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True))
+rows.append({"Etape": "PNG sur disque", "Fichier": "cropped_images/",
+             "Examens": "-", "Complets": "-", "Images": n_png})
+ipy_display(pd.DataFrame(rows).set_index("Etape"))
+
+rel_src = os.path.relpath(SOURCE_DIR, PROJECT_DIR) if SOURCE_DIR else "<input_dir>"
+rel_out = os.path.relpath(OUTPUT_DIR, PROJECT_DIR)
+print()
+print("Relancer ce pretraitement :")
+print(f"  make preprocess INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}")
+print(f"  make infer      OUTPUT_DIR={rel_out}")
+```

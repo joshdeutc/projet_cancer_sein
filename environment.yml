@@ -17,8 +17,8 @@ dependencies:
     - pydicom>=2.3
     - pylibjpeg>=2.0
     - pylibjpeg-libjpeg>=2.1
-    - torch>=1.9
-    - torchvision>=0.10
+    - torch>=2.0
+    - torchvision>=0.15
     - imageio>=2.9
     - h5py>=3.0
     - kaggle>=1.5
