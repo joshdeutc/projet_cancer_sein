@@ -1,5 +1,5 @@
 """
-Prétraitement GMIC — Étapes 1 à 5
+Prétraitement GMIC — Étapes 1 à 4
 -----------------------------------
 Prépare les images (DICOM ou PNG) pour l'inférence GMIC :
 
@@ -8,7 +8,9 @@ Prépare les images (DICOM ou PNG) pour l'inférence GMIC :
   3. Construction du PKL au format GMIC
   4. Recadrage (crop_mammogram.py)
   5. Redimensionnement à 2944×1920 + normalisation uint8
-  6. Calcul des centres optimaux (get_optimal_centers.py)
+
+Le flip horizontal (vues droites) et la normalisation mean/std sont appliqués
+directement à l'inférence — inutile de les précalculer.
 
 Le dossier de sortie contiendra :
   <output-dir>/cropped_images/         <- images prêtes pour l'inférence
@@ -414,7 +416,13 @@ def is_resize_done(cropped_dir: str, pkl_cropped: str) -> bool:
     return True
 
 
-def is_centers_done(pkl_final: str) -> bool:
+def copy_pkl_as_final(pkl_cropped: str, pkl_final: str):
+    """Copie cropped_exam_list.pkl en data.pkl — aucun best_center nécessaire."""
+    shutil.copy(pkl_cropped, pkl_final)
+    print(f"data.pkl genere depuis cropped_exam_list.pkl")
+
+
+def is_final_done(pkl_final: str) -> bool:
     return os.path.exists(pkl_final)
 
 
@@ -443,8 +451,6 @@ Exemples :
                         help="Forcer le crop meme s'il semble deja fait")
     parser.add_argument("--force-resize", action="store_true",
                         help="Forcer le resize meme s'il semble deja fait")
-    parser.add_argument("--force-centers", action="store_true",
-                        help="Forcer get_optimal_centers meme s'il semble deja fait")
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input_dir)
@@ -515,12 +521,10 @@ Exemples :
     else:
         resize_all(cropped_dir, pkl_cropped)
 
-    if args.force_centers:
-        run_optimal_centers(cropped_dir, pkl_cropped, pkl_final)
-    elif is_centers_done(pkl_final):
-        print(f"[AUTO] Centers : {pkl_final} deja present -> SKIP")
+    if is_final_done(pkl_final):
+        print(f"[AUTO] PKL final : {pkl_final} deja present -> SKIP")
     else:
-        run_optimal_centers(cropped_dir, pkl_cropped, pkl_final)
+        copy_pkl_as_final(pkl_cropped, pkl_final)
 
     print("\n" + "=" * 60)
     print("PREPROCESSING TERMINE")

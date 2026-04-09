@@ -1,9 +1,8 @@
 ---
-title: "Pipeline GMIC — Résultats"
-subtitle: "Rapport d'inférence sur les sorties de preprocess.py + inference.py"
+title: "Comment GMIC analyse vos mammographies"
+subtitle: "Guide visuel de l'inférence — de l'image prétraitée au score de cancer"
 format:
   html:
-    code-fold: true
     toc: true
     toc-depth: 3
 jupyter: gmic
@@ -11,8 +10,9 @@ jupyter: gmic
 
 ```{python}
 #| echo: false
-import os, glob, pickle, sys, re
+import os, glob, pickle, sys
 import cv2, numpy as np, pandas as pd
+import imageio
 import matplotlib.pyplot as plt, matplotlib.patches as mpatches
 from IPython.display import Markdown, display as ipy_display
 
@@ -31,15 +31,13 @@ sys.path.insert(0, os.path.join(PROJECT_DIR, "GMIC"))
 OUTPUT_ROOT = os.path.join(PROJECT_DIR, "output")
 
 GMIC_H, GMIC_W = 2944, 1920
-VIEWS     = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
-CROP_SIZE = 256
+VIEWS = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
+VIEWS_RIGHT = {"R-CC", "R-MLO"}
 
-# OUTPUT_DIR : variable d'environnement ou auto-detection
-raw_param  = os.environ.get("GMIC_OUTPUT_DIR", "")
+raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or ""
 if raw_param:
     OUTPUT_DIR = raw_param if os.path.isabs(raw_param) else os.path.join(PROJECT_DIR, raw_param)
 else:
-    # Auto : préférer celui avec predictions.csv le plus récent
     candidates = []
     if os.path.isdir(OUTPUT_ROOT):
         for name in sorted(os.listdir(OUTPUT_ROOT)):
@@ -65,206 +63,311 @@ def load_u8(path):
 
 def first_pid(exam):
     return next((exam[v][0].split("/")[0] for v in VIEWS if exam.get(v)), "?")
-
-# Extraction d'une fonction depuis un script
-def _read_script(name):
-    with open(os.path.join(PROJECT_DIR, "scripts", name)) as f:
-        return f.read()
-
-def extract_func(src, name):
-    m = re.search(rf'^(def {name}\(.*?)(?=\ndef |\nclass |\n# ── |\Z)', src,
-                  re.MULTILINE | re.DOTALL)
-    return m.group(1).rstrip() if m else f"# {name} non trouvée"
-
-PIPELINE_SRC  = _read_script("run_gmic_pipeline.py")
-INFERENCE_SRC = _read_script("inference.py")
-
-def show_func(src, name):
-    ipy_display(Markdown(f"```python\n{extract_func(src, name)}\n```"))
-
-def show_script(src):
-    ipy_display(Markdown(f"```python\n{src.strip()}\n```"))
 ```
 
-## Dossier analysé
+## Pourquoi une étape d'inférence séparée ?
 
-```{python}
-#| echo: false
-rel = os.path.relpath(OUTPUT_DIR, PROJECT_DIR)
-rows = []
-for label, path in [
-    ("data.pkl",         PKL_FINAL),
-    ("cropped_images/",  CROPPED_DIR),
-    ("predictions.csv",  PRED_PATH),
-    ("source_dir.txt",   SOURCE_FILE),
-]:
-    exists = os.path.isfile(path) or os.path.isdir(path)
-    rows.append({"Fichier": label, "Statut": "OK" if exists else "absent"})
-
-n_imgs = len(glob.glob(os.path.join(CROPPED_DIR, "**", "*.png"), recursive=True))
-ipy_display(Markdown(f"**Run** : `{rel}`  —  {n_imgs} images croppées\n"))
-ipy_display(pd.DataFrame(rows).set_index("Fichier"))
-```
+Le prétraitement (`make preprocess`) produit des images propres et uniformes dans
+`cropped_images/`. L'inférence (`make infer`) prend ces images et produit un **score
+de probabilité de cancer** pour chacune, en faisant tourner 5 modèles GMIC en parallèle
+et en moyennant leurs prédictions (**vote d'ensemble**).
 
 ---
 
-## Le pipeline complet (`run_gmic_pipeline.py`)
+## Étape 1 — Préparer l'image pour le modèle
 
-> Ce script orchestre les deux étapes en séquence : prétraitement puis inférence.
-> Pour les lancer séparément : `make preprocess` et `make infer`.
+Avant d'entrer dans le réseau, chaque image subit 3 transformations appliquées
+à la volée (pas stockées sur disque) :
 
-```{python}
-#| echo: false
-show_script(PIPELINE_SRC)
+```python
+def _load_and_prepare(image_path, view):
+    # 1. Lecture en float32
+    img = np.array(imageio.imread(image_path)).astype(np.float32)
+
+    # 2. Flip horizontal des vues droites (R-CC, R-MLO)
+    #    Le modèle a été entraîné avec tous les seins orientés vers la gauche.
+    #    Sans ce flip, les vues droites seraient "à l'envers" pour GMIC.
+    if view in {"R-CC", "R-MLO"}:
+        img = np.fliplr(img).copy()
+
+    # 3. Normalisation mean/std
+    #    Ramène les pixels à une distribution ~N(0, 1).
+    #    Rend le modèle insensible aux variations de luminosité entre scanners.
+    img -= img.mean()
+    img /= max(img.std(), 1e-5)
+    return img
 ```
 
----
+> Ces 3 étapes sont la seule préparation nécessaire. Le modèle reçoit ensuite
+> un tenseur `(1, 1, 2944, 1920)` float32 — une image, un canal (niveaux de gris).
 
-## Aperçu des images prétraitées
-
-> Images croppées et redimensionnées à 2944x1920 par `preprocess.py`.
-> Pour le diagnostic détaillé du prétraitement, voir `make notebook-preprocess`.
-
-```{python}
-#| echo: false
-if not os.path.isfile(PKL_FINAL):
-    print("data.pkl absent.")
-else:
-    with open(PKL_FINAL, "rb") as f:
-        exam_list = pickle.load(f)
-
-    complete = [e for e in exam_list if all(len(e.get(v,[])) > 0 for v in VIEWS)]
-    n_cancer = sum(1 for e in complete if e["cancer_label"]["malignant"])
-
-    ipy_display(pd.DataFrame([
-        {"Métrique": "Examens complets (4 vues)", "Valeur": len(complete)},
-        {"Métrique": "Cancer",                    "Valeur": n_cancer},
-        {"Métrique": "Sains",                     "Valeur": len(complete) - n_cancer},
-        {"Métrique": "Images croppées sur disque","Valeur": len(glob.glob(
-            os.path.join(CROPPED_DIR,"**","*.png"), recursive=True))},
-    ]).set_index("Métrique"))
-
-    demo_cancer = next((e for e in complete if e["cancer_label"]["malignant"]), None)
-    demo_sain   = next((e for e in complete if not e["cancer_label"]["malignant"]), None)
-    demo_exams  = {k: v for k, v in [("Cancer", demo_cancer), ("Sain", demo_sain)] if v}
-```
-
-### Avant / après recadrage
-
-```{python}
-#| echo: false
-if os.path.isfile(PKL_FINAL) and SOURCE_DIR and os.path.isdir(SOURCE_DIR):
-    for lbl, exam in demo_exams.items():
-        pid = first_pid(exam)
-        fig, axes = plt.subplots(2, 4, figsize=(18, 11))
-        fig.suptitle(f"Patient {lbl} ({pid}) — Original / Recadré + resize 2944x1920",
-                     fontsize=11, fontweight="bold")
-
-        for col, view in enumerate(VIEWS):
-            imgs = exam.get(view, [])
-            sfp  = imgs[0] if imgs else None
-            iid  = sfp.split("/")[1] if sfp else None
-
-            ax_o = axes[0][col]
-            img_o = load_u8(os.path.join(SOURCE_DIR, pid, iid + ".png")) if iid else None
-            if img_o is not None:
-                ax_o.imshow(img_o, cmap="gray")
-                ax_o.set_title(f"{view} — Original\n{img_o.shape[1]}x{img_o.shape[0]}", fontsize=9)
-            else:
-                ax_o.text(0.5, 0.5, "Source absente", ha="center", va="center",
-                          transform=ax_o.transAxes, fontsize=9)
-            ax_o.axis("off")
-
-            ax_c = axes[1][col]
-            img_c = load_u8(os.path.join(CROPPED_DIR, sfp + ".png")) if sfp else None
-            if img_c is not None:
-                ax_c.imshow(img_c, cmap="gray")
-                ax_c.set_title(f"Croppée\n{img_c.shape[1]}x{img_c.shape[0]}", fontsize=9)
-            else:
-                ax_c.text(0.5, 0.5, "Image absente", ha="center", va="center",
-                          transform=ax_c.transAxes, fontsize=9)
-            ax_c.axis("off")
-
-        axes[0][0].set_ylabel("Original", fontsize=11, labelpad=10)
-        axes[1][0].set_ylabel("Recadrée", fontsize=11, labelpad=10)
-        plt.tight_layout(); plt.show()
-elif not SOURCE_DIR:
-    # Afficher juste les croppées
-    if os.path.isfile(PKL_FINAL):
-        for lbl, exam in demo_exams.items():
-            pid = first_pid(exam)
-            fig, axes = plt.subplots(1, 4, figsize=(18, 5))
-            fig.suptitle(f"Patient {lbl} ({pid}) — Images croppées", fontsize=11, fontweight="bold")
-            for ax, view in zip(axes, VIEWS):
-                imgs = exam.get(view, [])
-                img = load_u8(os.path.join(CROPPED_DIR, imgs[0] + ".png")) if imgs else None
-                if img is not None:
-                    ax.imshow(img, cmap="gray")
-                    ax.set_title(f"{view}\n{img.shape[1]}x{img.shape[0]}", fontsize=9)
-                else:
-                    ax.text(0.5, 0.5, "Absent", ha="center", va="center", transform=ax.transAxes)
-                ax.axis("off")
-            plt.tight_layout(); plt.show()
-```
-
-### Centres optimaux GMIC
-
-> Croix **rouge** = `best_center` (où GMIC concentre son attention).
-> Rectangle **cyan** = patch local 256x256 utilisé par la branche locale du modèle.
+### Visualisation : avant et après normalisation
 
 ```{python}
 #| echo: false
 if os.path.isfile(PKL_FINAL):
+    with open(PKL_FINAL, "rb") as f:
+        exam_list = pickle.load(f)
+    complete = [e for e in exam_list if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    demo_cancer = next((e for e in complete if e["cancer_label"]["malignant"]), None)
+    demo_sain   = next((e for e in complete if not e["cancer_label"]["malignant"]), None)
+    demo_exams  = {k: v for k, v in [("Cancer", demo_cancer), ("Sain", demo_sain)] if v}
+
     for lbl, exam in demo_exams.items():
         pid = first_pid(exam)
-        cols_data = [(v, exam[v]) for v in VIEWS if exam.get(v)]
-        n_cols = len(cols_data)
-        fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 8))
-        if n_cols == 1: axes = [axes]
-        fig.suptitle(f"Patient {lbl} ({pid}) — Centres optimaux GMIC",
-                     fontsize=11, fontweight="bold")
+        # Prendre la vue L-CC comme exemple
+        view_demo = next((v for v in VIEWS if exam.get(v)), None)
+        if not view_demo: continue
+        sfp = exam[view_demo][0]
+        img_path = os.path.join(CROPPED_DIR, sfp + ".png")
+        if not os.path.isfile(img_path): continue
 
-        for ax, (view, imgs) in zip(axes, cols_data):
-            img = load_u8(os.path.join(CROPPED_DIR, imgs[0] + ".png"))
-            if img is None:
-                ax.text(0.5, 0.5, "Image manquante", ha="center", va="center",
-                        transform=ax.transAxes); ax.axis("off"); continue
+        img_raw = np.array(imageio.imread(img_path)).astype(np.float32)
+        if view_demo in VIEWS_RIGHT:
+            img_flip = np.fliplr(img_raw).copy()
+        else:
+            img_flip = img_raw.copy()
+        img_norm = img_flip.copy()
+        img_norm -= img_norm.mean()
+        img_norm /= max(img_norm.std(), 1e-5)
 
-            H, W = img.shape[:2]
-            ax.imshow(img, cmap="gray", aspect="auto")
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig.suptitle(f"Patient {lbl} ({pid}) — vue {view_demo}", fontsize=11, fontweight="bold")
 
-            centers = (exam.get("best_center") or {}).get(view, [])
-            if centers:
-                cy, cx = int(centers[0][0]), int(centers[0][1])
-                ax.plot(cx, cy, "r+", markersize=22, markeredgewidth=2.5, label="best_center")
-                half = CROP_SIZE // 2
-                rx0, ry0 = max(0, cx - half), max(0, cy - half)
-                ax.add_patch(mpatches.Rectangle(
-                    (rx0, ry0), min(CROP_SIZE, W - rx0), min(CROP_SIZE, H - ry0),
-                    linewidth=2, edgecolor="cyan", facecolor="none",
-                    label=f"Patch local {CROP_SIZE}x{CROP_SIZE}"
-                ))
-                ax.set_title(f"{view}\ncenter=({cx}, {cy})", fontsize=9)
-                ax.legend(fontsize=7, loc="lower right")
-            else:
-                ax.set_title(f"{view}\n(best_center absent)", fontsize=9)
-            ax.axis("off")
+        axes[0].imshow(img_raw, cmap="gray")
+        axes[0].set_title(f"1. Image uint8 lue\n"
+                          f"min={int(img_raw.min())}  max={int(img_raw.max())}  dtype=float32", fontsize=9)
+        axes[0].axis("off")
 
-        plt.tight_layout(); plt.show()
+        flipped = view_demo in VIEWS_RIGHT
+        axes[1].imshow(img_flip, cmap="gray")
+        axes[1].set_title(f"2. {'Flippée (vue droite)' if flipped else 'Pas de flip (vue gauche)'}\n"
+                          f"{'np.fliplr() appliqué' if flipped else 'identique à étape 1'}", fontsize=9)
+        axes[1].axis("off")
+
+        axes[2].imshow(img_norm, cmap="gray")
+        axes[2].set_title(f"3. Après normalisation mean/std\n"
+                          f"mean≈{img_norm.mean():.2f}  std≈{img_norm.std():.2f}", fontsize=9)
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+else:
+    print("data.pkl absent — lancez d'abord : make preprocess INPUT_DIR=... OUTPUT_DIR=...")
 ```
 
 ---
 
-## Inférence GMIC (`inference.py`)
+## Étape 2 — Convertir l'image en tenseur PyTorch
 
-> L'inférence fait tourner les 5 modèles GMIC en ensemble et moyenne leurs prédictions.
+Un réseau de neurones PyTorch ne "voit" pas des fichiers PNG. Il reçoit
+des **tenseurs** — des tableaux NumPy multidimensionnels emballés dans un objet
+PyTorch qui sait comment faire tourner les calculs sur GPU ou CPU.
+
+La conversion se fait en deux lignes :
+
+```python
+# img est un np.ndarray (2944, 1920) float32, déjà normalisé
+tensor = torch.Tensor(img[np.newaxis, np.newaxis])
+#                          └────────┘  └────────┘
+#                          ajout dim    ajout dim
+#                          "batch"      "canal"
+# résultat : tenseur de forme (1, 1, 2944, 1920)
+#             ┌── batch size = 1 (on envoie 1 image à la fois)
+#             │   └── canaux = 1 (image en niveaux de gris, pas RGB)
+```
+
+> PyTorch attend toujours des tenseurs en format **N×C×H×W** :
+> N = nombre d'images dans le batch, C = canaux couleur, H = hauteur, W = largeur.
+> Une photo couleur aurait C=3 (R, G, B). Ici C=1 car une mammographie est en niveaux de gris.
+
+### Visualisation : du tableau NumPy au tenseur
 
 ```{python}
 #| echo: false
-show_func(INFERENCE_SRC, "run_inference")
+import torch
+
+if os.path.isfile(PKL_FINAL):
+    with open(PKL_FINAL, "rb") as f:
+        exam_list = pickle.load(f)
+    complete = [e for e in exam_list if all(len(e.get(v,[])) > 0 for v in VIEWS)]
+    demo_cancer = next((e for e in complete if e["cancer_label"]["malignant"]), None)
+    demo_sain   = next((e for e in complete if not e["cancer_label"]["malignant"]), None)
+    demo_exams  = {k: v for k, v in [("Cancer", demo_cancer), ("Sain", demo_sain)] if v}
+
+    for lbl, exam in demo_exams.items():
+        pid = first_pid(exam)
+        view_demo = next((v for v in VIEWS if exam.get(v)), None)
+        if not view_demo: continue
+        sfp = exam[view_demo][0]
+        img_path = os.path.join(CROPPED_DIR, sfp + ".png")
+        if not os.path.isfile(img_path): continue
+
+        img_raw = np.array(imageio.imread(img_path)).astype(np.float32)
+        if view_demo in VIEWS_RIGHT:
+            img_flip = np.fliplr(img_raw).copy()
+        else:
+            img_flip = img_raw.copy()
+        img_norm = img_flip.copy()
+        img_norm -= img_norm.mean()
+        img_norm /= max(img_norm.std(), 1e-5)
+
+        tensor = torch.Tensor(img_norm[np.newaxis, np.newaxis])
+
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig.suptitle(f"Patient {lbl} ({pid}) — vue {view_demo}", fontsize=11, fontweight="bold")
+
+        axes[0].imshow(img_raw, cmap="gray")
+        axes[0].set_title(
+            f"np.ndarray lu depuis le PNG\n"
+            f"shape={img_raw.shape}  dtype=float32\n"
+            f"min={img_raw.min():.0f}  max={img_raw.max():.0f}", fontsize=9)
+        axes[0].axis("off")
+
+        flipped = view_demo in VIEWS_RIGHT
+        axes[1].imshow(img_norm, cmap="gray")
+        axes[1].set_title(
+            f"Après flip{'(vue droite)' if flipped else ''} + mean/std\n"
+            f"shape={img_norm.shape}  dtype=float32\n"
+            f"mean≈{img_norm.mean():.2f}  std≈{img_norm.std():.2f}", fontsize=9)
+        axes[1].axis("off")
+
+        axes[2].imshow(tensor[0, 0].numpy(), cmap="gray")
+        axes[2].set_title(
+            f"torch.Tensor — prêt pour le modèle\n"
+            f"shape={tuple(tensor.shape)}  (N, C, H, W)\n"
+            f"dtype={tensor.dtype}", fontsize=9)
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        plt.show()
+else:
+    print("data.pkl absent — lancez d'abord : make preprocess INPUT_DIR=... OUTPUT_DIR=...")
 ```
 
-### Résultats bruts
+---
+
+## Étape 3 — Instancier et charger le modèle
+
+Un modèle PyTorch est une **classe Python** héritant de `nn.Module`. L'instancier
+crée la structure du réseau (toutes les couches) avec des poids **aléatoires**.
+Pour avoir les vrais poids appris pendant l'entraînement, il faut les charger
+depuis un fichier `.p` (pickle de state_dict) :
+
+```python
+# 1. Créer la structure vide du modèle avec ses hyperparamètres
+model = gmic_module.GMIC(params)
+# À ce stade, model existe mais ses poids sont aléatoires — inutilisable.
+
+# 2. Charger les poids pré-entraînés depuis le fichier .p
+state_dict = torch.load("GMIC/models/sample_model_1.p", map_location="cpu")
+model.load_state_dict(state_dict, strict=False)
+# Maintenant model contient les poids appris sur INbreast/CBIS-DDSM.
+
+# 3. Passer en mode évaluation (désactive dropout, batch norm en mode train)
+model.eval()
+
+# 4. Inférence sans calculer les gradients (plus rapide, moins de mémoire)
+with torch.no_grad():
+    output = model(tensor)   # tensor shape : (1, 1, 2944, 1920)
+    # output shape : (1, 2)  →  [score_bénin, score_malin]
+```
+
+> **`strict=False`** : les poids du fichier `.p` ont été entraînés avec une
+> version légèrement différente de l'architecture. `strict=False` permet de
+> charger les poids qui correspondent et d'ignorer les autres.
+
+> **`torch.no_grad()`** : pendant l'entraînement, PyTorch mémorise toutes les
+> opérations pour calculer les gradients (backpropagation). À l'inférence on
+> n'en a pas besoin — ce contexte désactive ce mécanisme et divise par ~2
+> la consommation mémoire.
+
+---
+
+## Étape 4 — Pourquoi 5 modèles ? Le vote d'ensemble
+
+On charge et fait tourner **5 modèles** distincts, puis on **moyenne** leurs prédictions :
+
+```python
+all_dfs = []
+for idx in ["1", "2", "3", "4", "5"]:
+    # Chaque modèle a été entraîné avec un percent_t différent
+    # (seuil de sélection des patches : 0.02, 0.03, 0.03, 0.05, 0.10)
+    params["percent_t"] = PERCENT_T_DICT[idx]
+
+    model = gmic_module.GMIC(params)
+    model.load_state_dict(torch.load(f"sample_model_{idx}.p", map_location="cpu"), strict=False)
+    model.eval()
+
+    # Faire tourner ce modèle sur toutes les images
+    df = _run_one_model(model)
+    all_dfs.append(df)
+
+# Moyenne des 5 scores pour chaque image
+pred_df = pd.concat(all_dfs).groupby("image_index").apply(
+    lambda r: pd.Series({"malignant_pred": np.nanmean(r["malignant_pred"])})
+)
+```
+
+> **Pourquoi ça marche ?** Chaque modèle fait des erreurs différentes (ils
+> ne voient pas tous les cas difficiles de la même façon). En moyennant,
+> les erreurs individuelles se compensent et la prédiction finale est plus
+> robuste qu'un seul modèle — c'est le principe du **vote d'ensemble**.
+
+### Ce que retourne le modèle sur vos images
+
+```{python}
+#| echo: false
+if os.path.isfile(PKL_FINAL) and complete:
+    from src.modeling import gmic as gmic_module
+    from src.constants import PERCENT_T_DICT
+
+    params = {
+        "device_type": "cpu", "cam_size": (46, 30), "K": 6,
+        "crop_shape": (256, 256), "post_processing_dim": 256,
+        "num_classes": 2, "use_v1_global": False,
+        "max_crop_noise": (100, 100), "max_crop_size_noise": 100,
+    }
+
+    GMIC_DIR = os.path.join(PROJECT_DIR, "GMIC")
+    model_path = os.path.join(GMIC_DIR, "models", "sample_model_1.p")
+
+    if os.path.isfile(model_path):
+        params["percent_t"] = PERCENT_T_DICT["1"]
+        model = gmic_module.GMIC(params)
+        model.load_state_dict(torch.load(model_path, map_location="cpu"), strict=False)
+        model.eval()
+
+        rows = []
+        with torch.no_grad():
+            for lbl, exam in demo_exams.items():
+                pid = first_pid(exam)
+                for view in VIEWS:
+                    if not exam.get(view): continue
+                    sfp = exam[view][0]
+                    img_path = os.path.join(CROPPED_DIR, sfp + ".png")
+                    if not os.path.isfile(img_path): continue
+                    img = np.array(imageio.imread(img_path)).astype(np.float32)
+                    if view in VIEWS_RIGHT:
+                        img = np.fliplr(img).copy()
+                    img -= img.mean(); img /= max(img.std(), 1e-5)
+                    tensor = torch.Tensor(img[np.newaxis, np.newaxis])
+                    out = model(tensor).data.cpu().numpy()[0]
+                    rows.append({
+                        "Patient": lbl, "Vue": view,
+                        "score bénin":  f"{out[0]:.4f}",
+                        "score malin":  f"{out[1]:.4f}",
+                        "→ verdict":    "CANCER" if out[1] > 0.5 else "sain",
+                    })
+
+        ipy_display(pd.DataFrame(rows).set_index(["Patient", "Vue"]))
+    else:
+        print("Modèles GMIC absents — placez sample_model_1.p...5.p dans GMIC/models/")
+```
+
+---
+
+## Résultats
 
 ```{python}
 #| echo: false
@@ -275,8 +378,10 @@ if not os.path.isfile(PRED_PATH):
 else:
     pred_df = pd.read_csv(PRED_PATH)
     n_pos = int(pred_df["malignant_label"].sum()) if "malignant_label" in pred_df.columns else None
-    print(f"Prédictions : {len(pred_df)} examens"
-          + (f"  ({n_pos} cancer, {len(pred_df)-n_pos} sains)" if n_pos is not None else ""))
+    ipy_display(Markdown(
+        f"**{len(pred_df)} images** analysées"
+        + (f" — {n_pos} cancer, {len(pred_df)-n_pos} saines" if n_pos is not None else "")
+    ))
     ipy_display(pred_df.sort_values("malignant_pred", ascending=False))
 ```
 
@@ -308,15 +413,17 @@ if not pred_df.empty and "malignant_label" in pred_df.columns:
         axes[1].hist(y_score[y_true == 1], bins=20, alpha=0.7, color="tomato",    label="Cancer")
         axes[1].axvline(0.5, color="black", linestyle="--", lw=1, label="Seuil 0.5")
         axes[1].set_xlabel("Score malignant_pred")
-        axes[1].set_ylabel("Examens")
+        axes[1].set_ylabel("Images")
         axes[1].set_title("Distribution des scores")
         axes[1].legend()
 
-        report = classification_report(y_true, y_bin, target_names=["Sain", "Cancer"], output_dict=True, zero_division=0)
+        report = classification_report(y_true, y_bin,
+                                       target_names=["Sain", "Cancer"],
+                                       output_dict=True, zero_division=0)
         axes[2].axis("off")
         axes[2].text(0.05, 0.95, "\n".join([
             f"AUC-ROC  : {auc:.4f}",
-            f"Examens  : {len(y_true)} ({n_pos} cancer, {n_neg} sains)",
+            f"Images   : {len(y_true)} ({n_pos} cancer, {n_neg} saines)",
             f"Seuil    : 0.5",
             "",
             "             Precision  Rappel    F1",
@@ -342,8 +449,8 @@ if not pred_df.empty and "malignant_label" in pred_df.columns:
 
 ## Cas les plus suspects
 
-> Les 6 examens avec le score `malignant_pred` le plus élevé.
-> Bordure **verte** = prédiction correcte, **rouge** = erreur.
+Les images avec le score `malignant_pred` le plus élevé.
+Bordure **verte** = prédiction correcte, **rouge** = erreur.
 
 ```{python}
 #| echo: false
@@ -384,26 +491,26 @@ if not pred_df.empty:
     for ax in axes[len(top_df):]:
         ax.axis("off")
 
-    plt.suptitle(f"Top {top_n} examens par score de malignité", fontsize=13, fontweight="bold")
+    plt.suptitle(f"Top {top_n} images par score de malignité", fontsize=13, fontweight="bold")
     plt.tight_layout(); plt.show()
 ```
 
 ---
 
-## Commandes
+## Relancer
 
 ```{python}
 #| echo: false
 rel_out = os.path.relpath(OUTPUT_DIR, PROJECT_DIR)
 rel_src = os.path.relpath(SOURCE_DIR, PROJECT_DIR) if SOURCE_DIR else "<input_dir>"
-print("Relancer le pipeline complet :")
-print(f"  make run        INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}")
-print()
-print("Étapes séparées :")
-print(f"  make preprocess INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}")
-print(f"  make infer      OUTPUT_DIR={rel_out}")
-print()
-print("Changer le dossier analysé :")
-print(f"  make notebook          OUTPUT_DIR=output/mon_run")
-print(f"  make notebook-preprocess OUTPUT_DIR=output/mon_run")
+ipy_display(Markdown(f"""
+~~~bash
+# Pipeline complet
+make run INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}
+
+# Étapes séparées
+make preprocess INPUT_DIR={rel_src} OUTPUT_DIR={rel_out}
+make infer      OUTPUT_DIR={rel_out}
+~~~
+"""))
 ```

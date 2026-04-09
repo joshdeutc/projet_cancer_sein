@@ -6,8 +6,13 @@ les prédictions de cancer du sein.
 
 Prérequis : avoir exécuté preprocess.py sur le même --output-dir.
 Les fichiers attendus dans --output-dir :
-  cropped_images/   <- images 2944×1920 prêtes
-  data.pkl          <- PKL avec best_center
+  cropped_images/   <- images 2944×1920 uint8 prêtes
+  data.pkl          <- PKL (cropped_exam_list.pkl copié)
+
+À l'inférence, chaque image subit 3 transformations :
+  1. Lecture en float32
+  2. Flip horizontal (vues droites R-CC, R-MLO) — aligne tous les seins
+  3. Normalisation mean/std — centre la distribution pour le modèle
 
 Résultats produits dans --output-dir :
   predictions.csv   <- scores malignant/benign + labels
@@ -23,6 +28,7 @@ import argparse
 
 import numpy as np
 import pandas as pd
+import imageio
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -31,6 +37,24 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 GMIC_DIR = os.path.join(PROJECT_DIR, "GMIC")
 
 sys.path.insert(0, GMIC_DIR)
+
+VIEWS_RIGHT = {"R-CC", "R-MLO"}
+VIEWS_LIST  = ["L-CC", "R-CC", "L-MLO", "R-MLO"]
+
+
+def _load_and_prepare(image_path: str, view: str) -> np.ndarray:
+    """
+    3 étapes nécessaires avant de passer l'image au modèle :
+      1. Lecture en float32
+      2. Flip horizontal (vues droites) — aligne tous les seins vers la gauche
+      3. Normalisation mean/std — centre la distribution pour le modèle
+    """
+    img = np.array(imageio.imread(image_path)).astype(np.float32)
+    if view in VIEWS_RIGHT:
+        img = np.fliplr(img).copy() # <-- AJOUTE .copy() ICI
+    img -= img.mean()
+    img /= max(img.std(), 1e-5)
+    return img
 
 
 # ── Inférence ensemble 5 modèles ─────────────────────────────────────────────
@@ -42,12 +66,12 @@ def run_inference(cropped_dir: str, pkl_final: str, output_dir: str,
     print("=" * 60)
 
     import torch
+    import tqdm
     from src.modeling import gmic as gmic_module
-    from src.scripts.run_model import run_model
     from src.constants import PERCENT_T_DICT
     import src.utilities.pickling as pickling
 
-    os.makedirs(os.path.join(output_dir, "visualization"), exist_ok=True)
+    device = torch.device("cpu")
 
     params = {
         "device_type": "cpu",
@@ -59,15 +83,12 @@ def run_inference(cropped_dir: str, pkl_final: str, output_dir: str,
         "use_v1_global": False,
         "max_crop_noise": (100, 100),
         "max_crop_size_noise": 100,
-        "image_path": cropped_dir,
-        "segmentation_path": output_dir,
-        "output_path": output_dir,
     }
 
     exam_list_raw = pickling.unpickle_from_file(pkl_final)
     exam_list = [
         exam for exam in exam_list_raw
-        if all(len(exam[v]) > 0 for v in ["L-CC", "R-CC", "L-MLO", "R-MLO"])
+        if all(len(exam.get(v, [])) > 0 for v in VIEWS_LIST)
     ]
     skipped = len(exam_list_raw) - len(exam_list)
     if skipped > 0:
@@ -76,16 +97,41 @@ def run_inference(cropped_dir: str, pkl_final: str, output_dir: str,
         print("ERREUR : Aucun examen complet (4 vues). Impossible de lancer l'inference.")
         return None
 
+    def _run_one_model(model):
+        pred_dict = {"image_index": [], "benign_pred": [], "malignant_pred": [],
+                     "benign_label": [], "malignant_label": []}
+        model.eval()
+        with torch.no_grad():
+            for datum in tqdm.tqdm(exam_list, leave=False):
+                cancer = datum["cancer_label"]
+                for view in VIEWS_LIST:
+                    sfp = datum[view][0]
+                    img = _load_and_prepare(
+                        os.path.join(cropped_dir, sfp + ".png"), view
+                    )
+                    tensor = torch.Tensor(img[np.newaxis, np.newaxis]).to(device)
+                    out = model(tensor).data.cpu().numpy()
+                    if view in ["L-CC", "L-MLO"]:
+                        b_lbl, m_lbl = cancer["left_benign"], cancer["left_malignant"]
+                    else:
+                        b_lbl, m_lbl = cancer["right_benign"], cancer["right_malignant"]
+                    pred_dict["image_index"].append(sfp)
+                    pred_dict["benign_pred"].append(float(out[0, 0]))
+                    pred_dict["malignant_pred"].append(float(out[0, 1]))
+                    pred_dict["benign_label"].append(b_lbl)
+                    pred_dict["malignant_label"].append(m_lbl)
+        return pd.DataFrame(pred_dict)
+
     all_dfs = []
 
     for idx in ["1", "2", "3", "4", "5"]:
         params["percent_t"] = PERCENT_T_DICT[idx]
-        model = gmic_module.GMIC(params)
+        model = gmic_module.GMIC(params).to(device)
         model_path = os.path.join(GMIC_DIR, "models", f"sample_model_{idx}.p")
         model.load_state_dict(
             torch.load(model_path, map_location="cpu"), strict=False
         )
-        df = run_model(model, exam_list, params, turn_on_visualization=False)
+        df = _run_one_model(model)
         all_dfs.append(df)
         print(f"  Modele {idx} : {len(df)} predictions")
 

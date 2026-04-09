@@ -9,7 +9,7 @@ puis les analyse en detail (branche locale) avant de fusionner les deux avis
 pour produire un score de probabilite de cancer.
 
 Ce repo fournit :
-- Le **preprocessing** complet (DICOM/PNG → crop → resize → centres optimaux)
+- Le **preprocessing** (DICOM/PNG → crop → resize 2944×1920)
 - L'**inference** avec les 5 modeles pre-entraines GMIC (vote ensemble)
 - Un systeme de **validation** des donnees d'entree
 - Des **notebooks Quarto** pour visualiser chaque etape
@@ -17,18 +17,39 @@ Ce repo fournit :
 
 > **Documentation detaillee** : les rapports HTML sont dans [`docs/`](docs/) (lisibles directement via GitHub Pages).
 > - [Rapport de tests](docs/test_validation_report.html) — tests unitaires + validation
-> - [Diagnostic pretraitement](docs/preprocess_gmic.html) — visualisation des etapes 1 a 5
+> - [Diagnostic pretraitement](docs/preprocess_gmic.html) — visualisation des etapes
 > - [Inspection pipeline](docs/pipeline_gmic.html) — predictions et saliency maps
+
+---
+
+## Flux de donnees
+
+```mermaid
+flowchart LR
+    A([Vos images\nDICOM ou PNG]) --> B{Format ?}
+    B -->|DICOM .dcm| C[Conversion\nDICOM -> PNG]
+    B -->|PNG| D[Construction\ndu PKL GMIC]
+    C --> D
+
+    D --> E[Recadrage\ncrop_mammogram]
+    E --> F[Resize 2944x1920\n+ normalisation uint8]
+    F --> G[Inference\n5 modeles GMIC\nflip + mean/std]
+
+    G --> H([output/\npredictions.csv\nAUC-ROC])
+```
 
 ---
 
 ## Prerequis
 
 - **[Miniconda](https://docs.conda.io/en/latest/miniconda.html) ou Anaconda** — conda cree un environnement Python isole avec les dependances exactes du projet.
-- **[Quarto](https://quarto.org/docs/get-started/)** — pour rendre les notebooks `.qmd` en HTML/PDF (optionnel si vous n'utilisez pas les notebooks).
-- **Compte Kaggle** avec acces a la competition [rsna-breast-cancer-detection](https://www.kaggle.com/competitions/rsna-breast-cancer-detection) et une cle API (`kaggle.json`).
+- **[Quarto](https://quarto.org/docs/get-started/)** — pour rendre les notebooks `.qmd` en HTML (optionnel).
 - **Poids GMIC** (`sample_model_1.p` a `sample_model_5.p`) a placer dans `GMIC/models/`.
-- **GPU NVIDIA** (optionnel) — le pipeline tourne en CPU par defaut. Pour le fine-tuning, un GPU avec CUDA est necessaire.
+- **Vos images** — DICOM ou PNG, organisees par patient avec un `train.csv`.
+
+> **Donnees de test incluses** : `data/sample/` contient 2 patients (8 images, ~52 Mo) — aucun telechargement necessaire pour tester le pipeline.
+>
+> **Dataset complet (optionnel)** : pour utiliser le dataset RSNA (~1.5 Go), voir [docs/kaggle_setup.md](docs/kaggle_setup.md).
 
 ---
 
@@ -41,15 +62,8 @@ make build
 # 2. Activer l'environnement (a faire dans chaque nouveau terminal)
 conda activate gmic
 
-# 3. Configurer les cles Kaggle
-make setup
-```
-
-`make setup` cree un fichier `.env` depuis `.env.example`. Editez-le avec vos identifiants Kaggle :
-
-```ini
-KAGGLE_USERNAME=votre_username   # depuis kaggle.json -> "username"
-KAGGLE_KEY=votre_api_key         # depuis kaggle.json -> "key"
+# 3. Verifier que tout est en place
+make check
 ```
 
 ---
@@ -73,13 +87,8 @@ Vous devriez obtenir des predictions pour 8 images avec un AUC-ROC de 1.0 sur ce
 
 ## Utilisation
 
-### Pipeline principal
-
 ```bash
-# Telecharger un subset Kaggle
-make pull-data
-
-# Valider les donnees (format images, CSV)
+# Valider vos donnees (format images, CSV)
 make validate INPUT_DIR=data/demo
 
 # Pipeline complet en une commande (preprocess + inference)
@@ -113,7 +122,7 @@ Deux commandes complementaires :
 | `make validate INPUT_DIR=...` | "Mes **donnees** sont bonnes ?" | Verifie vos vraies images (format, taille, CSV) |
 
 ```bash
-make test                          # tests unitaires (images synthetiques, rapide)
+make test                            # tests unitaires (images synthetiques, rapide)
 make validate INPUT_DIR=data/sample  # validation de vraies images
 ```
 
@@ -121,30 +130,24 @@ make validate INPUT_DIR=data/sample  # validation de vraies images
 
 ## Notebooks (Quarto)
 
-Les notebooks sont au format `.qmd` ([Quarto](https://quarto.org)) et se rendent en HTML ou PDF.
+Les notebooks sont au format `.qmd` ([Quarto](https://quarto.org)) et se rendent en HTML.
 
-### Deux types de notebooks
-
-| Notebook | Type | Ce qu'il fait | PDF |
-|---|---|---|---|
-| `test` | **Executeur** | Lance `pytest` + `check_image()` a chaque rendu | [test_validation_report.html](docs/test_validation_report.html) |
-| `extract` | **Executeur** | Telecharge les images depuis Kaggle a chaque rendu | — |
-| `preprocess` | **Visionneuse** | Lit ce que `make preprocess` a produit dans `OUTPUT_DIR` | [preprocess_gmic.html](docs/preprocess_gmic.html) |
-| `pipeline` | **Visionneuse** | Lit ce que `make infer` a produit dans `OUTPUT_DIR` | [pipeline_gmic.html](docs/pipeline_gmic.html) |
+| Notebook | Type | Ce qu'il fait |
+|---|---|---|
+| `test` | **Executeur** | Lance `pytest` + `check_image()` a chaque rendu — [rapport HTML](docs/test_validation_report.html) |
+| `preprocess` | **Visionneuse** | Explique les etapes de preprocessing avec visuels — [rapport HTML](docs/preprocess_gmic.html) |
+| `pipeline` | **Visionneuse** | Lit ce que `make infer` a produit dans `OUTPUT_DIR` — [rapport HTML](docs/pipeline_gmic.html) |
 
 > Les notebooks **visionneuses** (`preprocess`, `pipeline`) ne montrent rien si `OUTPUT_DIR` est vide.
 > Il faut d'abord lancer le pipeline (ex: `make run INPUT_DIR=data/sample OUTPUT_DIR=output/sample`).
 
-### Commandes
-
 ```bash
 # Generer un HTML statique
-make notebook NOTEBOOK=test                               # rapport de tests
+make notebook NOTEBOOK=test                                  # rapport de tests
 make notebook NOTEBOOK=preprocess OUTPUT_DIR=output/sample  # diagnostic pretraitement
 make notebook NOTEBOOK=pipeline   OUTPUT_DIR=output/sample  # inspection predictions
 
 # Previsualiser en live (re-execute a chaque sauvegarde du .qmd)
-make notebook-serve NOTEBOOK=test
 make notebook-serve NOTEBOOK=preprocess OUTPUT_DIR=output/sample
 ```
 
@@ -152,39 +155,16 @@ make notebook-serve NOTEBOOK=preprocess OUTPUT_DIR=output/sample
 
 ---
 
-## Flux de donnees
-
-```mermaid
-flowchart LR
-    A([Kaggle\nRSNA dataset]) -->|make pull-data| B[data/\ntrain_images/\ntrain.csv]
-
-    B --> C{Format ?}
-    C -->|DICOM .dcm| D[Conversion\nDICOM -> PNG]
-    C -->|PNG| E[Construction\ndu PKL GMIC]
-    D --> E
-
-    E --> F[Recadrage\ncrop_mammogram]
-    F --> G[Resize 2944x1920\n+ normalisation uint8]
-    G --> H[Centres optimaux\nget_optimal_centers]
-    H --> I[Inference\n5 modeles GMIC]
-
-    I --> J([output/\npredictions.csv\nAUC-ROC])
-```
-
----
-
 ## Commandes disponibles
 
 | Commande | Description |
 |---|---|
-| `make build` | Creer l'environnement et installer les dependances |
-| `make setup` | Configurer `.env`, verifier Kaggle |
+| `make build` | Creer l'environnement conda et installer les dependances |
 | `make check` | Verifier dependances, modeles GMIC, donnees |
-| `make pull-data` | Telecharger les donnees depuis Kaggle |
 | `make validate` | Valider les donnees d'entree (format, CSV, images) |
-| `make run` | Lancer la pipeline complete GMIC en une seule commande |
-| `make preprocess` | Lancer uniquement le pretraitement (etapes 1-5) |
-| `make infer` | Lancer uniquement l'inference (etapes 6-7) |
+| `make run` | Lancer le pipeline complet GMIC en une seule commande |
+| `make preprocess` | Lancer uniquement le pretraitement (crop + resize) |
+| `make infer` | Lancer uniquement l'inference (flip + normalisation + modele) |
 | `make notebook [NOTEBOOK=...]` | Rendre un notebook en HTML |
 | `make notebook-serve [NOTEBOOK=...]` | Previsualiser un notebook en live |
 | `make freeze` | Figer les versions des packages |
@@ -199,25 +179,24 @@ flowchart LR
 ├── Makefile
 ├── pyproject.toml
 ├── environment.yml           <- Environnement conda (make build)
-├── .env.example              <- Copier en .env et remplir
 ├── GMIC/                     <- Modele GMIC (poids dans GMIC/models/)
 ├── scripts/
 │   ├── run_gmic_pipeline.py  <- Pipeline complet (make run)
-│   ├── preprocess.py         <- Pretraitement GMIC (etapes 1-5)
-│   ├── inference.py          <- Inference GMIC (etapes 6-7)
-│   ├── extract_download.py   <- Telechargement Kaggle (anti-429)
+│   ├── preprocess.py         <- Pretraitement (DICOM/PNG -> crop -> resize)
+│   ├── inference.py          <- Inference (flip + mean/std + 5 modeles GMIC)
 │   └── validate_input.py     <- Validation des donnees d'entree
+├── extraction_project/       <- Telechargement Kaggle (voir docs/kaggle_setup.md)
 ├── script_notebook/
 │   ├── pipeline_gmic.qmd           <- Inspection des sorties
-│   ├── preprocess_gmic.qmd         <- Diagnostic du pretraitement
-│   ├── extract_download.qmd        <- Documentation de l'extraction
+│   ├── preprocess_gmic.qmd         <- Guide visuel du pretraitement
 │   └── test_validation_report.qmd  <- Rapport de tests avec images
 ├── tests/
 │   └── test_validate_input.py  <- Tests unitaires (CSV, images)
 ├── docs/                            <- GitHub Pages (rapports HTML)
-│   ├── test_validation_report.html  <- Rapport de tests
-│   ├── preprocess_gmic.html         <- Diagnostic pretraitement
-│   ├── pipeline_gmic.html           <- Inspection pipeline
+│   ├── test_validation_report.html
+│   ├── preprocess_gmic.html
+│   ├── pipeline_gmic.html
+│   ├── kaggle_setup.md              <- Guide telechargement Kaggle
 │   └── troubleshooting.md           <- Erreurs courantes et solutions
 ├── data/
 │   ├── sample/               <- Donnees de demo (2 patients, 8 images, ~52 Mo)
