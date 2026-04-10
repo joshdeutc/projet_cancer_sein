@@ -87,6 +87,12 @@ Elle corrige aussi une particularité de certains scanners qui stockent les nive
 inversés (**MONOCHROME1**) : sans correction, le tissu mammaire apparaîtrait en
 noir sur fond blanc — l'inverse de ce qu'attend GMIC.
 
+```python
+# preprocess.py · ligne 112
+if ds.PhotometricInterpretation == "MONOCHROME1":
+    arr = arr.max() - arr   # inverse les niveaux : blanc ↔ noir
+```
+
 > Si vos images sont déjà en PNG (comme les données `data/sample/`), cette étape
 > est ignorée automatiquement.
 
@@ -177,6 +183,19 @@ Pour chaque patient, ce fichier liste :
 Cette étape lit votre `train.csv` et construit ce fichier pickle.
 C'est la "colonne vertébrale" que toutes les étapes suivantes vont enrichir.
 
+```python
+# preprocess.py · lignes 150–154
+"cancer_label": {
+    "malignant":       0,   # ← 1 si le patient a un cancer (n'importe quel côté)
+    "left_malignant":  0,   # ← 1 si cancer côté gauche
+    "right_malignant": 0,   # ← 1 si cancer côté droit
+    ...
+}
+```
+
+> Ces labels sont lus depuis la colonne `cancer` de votre `train.csv` et propagés
+> par latéralité. L'inférence les réutilise pour calculer l'AUC-ROC.
+
 ---
 
 ## Étape 3 — Recadrage (`crop_mammogram`)
@@ -188,6 +207,19 @@ bonnes performances si le fond noir est présent.
 `crop_mammogram` détecte automatiquement le tissu mammaire par seuillage et
 supprime les bords noirs. Il mémorise dans le PKL la `window_location` — les
 coordonnées exactes de la zone découpée dans l'image originale.
+
+```python
+# preprocess.py · lignes 210–215
+src/cropping/crop_mammogram.py
+    --input-data-folder  <png_dir>         # images PNG sources
+    --output-data-folder <cropped_dir>     # où écrire les PNG recadrés
+    --exam-list-path     <pkl_raw>         # PKL d'entrée (construit à l'étape 2)
+    --cropped-exam-list-path <pkl_crop>    # PKL de sortie (avec window_location)
+    --num-processes 4                      # parallélisation sur 4 cœurs
+```
+
+> `crop_mammogram` est le script GMIC original — on l'appelle en sous-processus
+> pour réutiliser exactement la même logique que les auteurs du papier.
 
 ### Avant et après recadrage
 
@@ -290,6 +322,16 @@ en **uint8** (valeurs entières de 0 à 255).
 Ces deux contraintes — taille fixe et type uint8 — sont des prérequis stricts :
 un modèle PyTorch ne peut pas traiter un batch d'images de tailles différentes,
 et les poids ont été appris avec cette plage de valeurs.
+
+```python
+# preprocess.py · lignes 279–280
+interp = cv2.INTER_AREA if (h > GMIC_H or w > GMIC_W) else cv2.INTER_LINEAR
+img_resized = cv2.resize(img, (GMIC_W, GMIC_H), interpolation=interp)
+```
+
+> **Pourquoi deux interpolations ?** `INTER_AREA` (réduction) évite l'aliasing
+> quand on rétrécit — il moyenne les pixels voisins. `INTER_LINEAR` (agrandissement)
+> interpole en bilinéaire quand on agrandit — il est plus doux que le voisin le plus proche.
 
 ```{python}
 #| echo: false

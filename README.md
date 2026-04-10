@@ -53,6 +53,34 @@ flowchart LR
 
 ---
 
+## Format des donnees d'entree
+
+```
+INPUT_DIR/
+├── train.csv
+└── train_images/
+    ├── <patient_id>/
+    │   ├── <image_id>.png   (ou .dcm)
+    │   └── ...
+    └── ...
+```
+
+Le CSV doit contenir ces colonnes :
+
+| Colonne | Description |
+|---|---|
+| `patient_id` | Correspond au nom du sous-dossier dans `train_images/` |
+| `image_id` | Correspond au nom du fichier (sans extension) |
+| `laterality` | `L` ou `R` (gauche / droite) |
+| `view` | `CC` ou `MLO` |
+| `cancer` | `0` ou `1` |
+
+> GMIC s'attend a **4 vues par patient** (L-CC, L-MLO, R-CC, R-MLO).
+> Un patient avec une vue manquante est ignore a l'inference.
+> Les images peuvent etre en **PNG** ou **DICOM** — le format est auto-detecte.
+
+---
+
 ## Installation
 
 ```bash
@@ -130,7 +158,7 @@ make validate INPUT_DIR=data/sample  # validation de vraies images
 
 ## Notebooks (Quarto)
 
-Les notebooks sont au format `.qmd` ([Quarto](https://quarto.org)) et se rendent en HTML.
+Les notebooks sont au format `.qmd` ([Quarto](https://quarto.org)) et se rendent en HTML ou PDF.
 
 | Notebook | Type | Ce qu'il fait |
 |---|---|---|
@@ -146,6 +174,9 @@ Les notebooks sont au format `.qmd` ([Quarto](https://quarto.org)) et se rendent
 make notebook NOTEBOOK=test                                  # rapport de tests
 make notebook NOTEBOOK=preprocess OUTPUT_DIR=output/sample  # diagnostic pretraitement
 make notebook NOTEBOOK=pipeline   OUTPUT_DIR=output/sample  # inspection predictions
+
+# Generer un PDF statique
+make notebook-pdf NOTEBOOK=pipeline OUTPUT_DIR=output/sample # inspection predictions (PDF)
 
 # Previsualiser en live (re-execute a chaque sauvegarde du .qmd)
 make notebook-serve NOTEBOOK=preprocess OUTPUT_DIR=output/sample
@@ -166,6 +197,7 @@ make notebook-serve NOTEBOOK=preprocess OUTPUT_DIR=output/sample
 | `make preprocess` | Lancer uniquement le pretraitement (crop + resize) |
 | `make infer` | Lancer uniquement l'inference (flip + normalisation + modele) |
 | `make notebook [NOTEBOOK=...]` | Rendre un notebook en HTML |
+| `make notebook-pdf [NOTEBOOK=...]` | Rendre un notebook en PDF |
 | `make notebook-serve [NOTEBOOK=...]` | Previsualiser un notebook en live |
 | `make freeze` | Figer les versions des packages |
 | `make test` | Lancer les tests unitaires |

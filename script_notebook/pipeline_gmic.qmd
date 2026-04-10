@@ -80,17 +80,18 @@ Avant d'entrer dans le réseau, chaque image subit 3 transformations appliquées
 à la volée (pas stockées sur disque) :
 
 ```python
+# inference.py · ligne 45
 def _load_and_prepare(image_path, view):
-    # 1. Lecture en float32
+    # 1. Lecture en float32 — ligne 52
     img = np.array(imageio.imread(image_path)).astype(np.float32)
 
-    # 2. Flip horizontal des vues droites (R-CC, R-MLO)
+    # 2. Flip horizontal des vues droites (R-CC, R-MLO) — ligne 53–54
     #    Le modèle a été entraîné avec tous les seins orientés vers la gauche.
     #    Sans ce flip, les vues droites seraient "à l'envers" pour GMIC.
     if view in {"R-CC", "R-MLO"}:
         img = np.fliplr(img).copy()
 
-    # 3. Normalisation mean/std
+    # 3. Normalisation mean/std — lignes 55–56
     #    Ramène les pixels à une distribution ~N(0, 1).
     #    Rend le modèle insensible aux variations de luminosité entre scanners.
     img -= img.mean()
@@ -167,6 +168,7 @@ PyTorch qui sait comment faire tourner les calculs sur GPU ou CPU.
 La conversion se fait en deux lignes :
 
 ```python
+# inference.py · ligne 112
 # img est un np.ndarray (2944, 1920) float32, déjà normalisé
 tensor = torch.Tensor(img[np.newaxis, np.newaxis])
 #                          └────────┘  └────────┘
@@ -255,6 +257,7 @@ Pour avoir les vrais poids appris pendant l'entraînement, il faut les charger
 depuis un fichier `.p` (pickle de state_dict) :
 
 ```python
+# inference.py · lignes 129–133
 # 1. Créer la structure vide du modèle avec ses hyperparamètres
 model = gmic_module.GMIC(params)
 # À ce stade, model existe mais ses poids sont aléatoires — inutilisable.
@@ -289,6 +292,7 @@ with torch.no_grad():
 On charge et fait tourner **5 modèles** distincts, puis on **moyenne** leurs prédictions :
 
 ```python
+# inference.py · lignes 127–147
 all_dfs = []
 for idx in ["1", "2", "3", "4", "5"]:
     # Chaque modèle a été entraîné avec un percent_t différent

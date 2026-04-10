@@ -2,7 +2,7 @@
 ## Usage : make <commande>
 
 .DEFAULT_GOAL := help
-.PHONY: help build setup check validate pull-data preprocess infer notebook notebook-serve run freeze test require-env require-kaggle-env
+.PHONY: help build setup check validate pull-data preprocess infer notebook notebook-pdf notebook-serve run freeze test require-env require-kaggle-env
 
 CONDA_ENV  := gmic
 CONDA_RUN  := conda run -n $(CONDA_ENV) --no-capture-output
@@ -54,6 +54,7 @@ help: ## Affiche cette aide
 	@echo "    make preprocess     <- lancer les etapes 1-5"
 	@echo "    make infer          <- lancer les etapes 6-7"
 	@echo "    make notebook       <- executer et rendre le notebook en HTML"
+	@echo "    make notebook-pdf   <- executer et rendre le notebook en PDF"
 	@echo "    make notebook-serve <- visualiser le notebook dans le navigateur"
 	@echo "    make run            <- lancer le pipeline"
 	@echo ""
@@ -162,11 +163,11 @@ infer: require-env ## Lancer uniquement l'inference (etapes 6-7)
 
 notebook: require-env ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|extract|preprocess]
 	@QMD=$$(case "$(NOTEBOOK)" in \
-		pipeline)   echo "script_notebook/pipeline_gmic.qmd" ;; \
-		test)       echo "script_notebook/test_validation_report.qmd" ;; \
-		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
-		preprocess) echo "script_notebook/preprocess_gmic.qmd" ;; \
-		*)          echo "$(NOTEBOOK)" ;; \
+		pipeline)                echo "script_notebook/pipeline_gmic.qmd" ;; \
+		test|test_validation*)   echo "script_notebook/test_validation_report.qmd" ;; \
+		extract)                 echo "extraction_project/notebook/extract_download.qmd" ;; \
+		preprocess)              echo "script_notebook/preprocess_gmic.qmd" ;; \
+		*)                       echo "$(NOTEBOOK)" ;; \
 	esac); \
 	HTML=$${QMD%.qmd}.html; \
 	if ! command -v quarto >/dev/null 2>&1; then \
@@ -186,12 +187,38 @@ notebook: require-env ## Rendre un notebook en HTML  [NOTEBOOK=pipeline|test|ext
 		--to html --execute --no-execute-daemon; \
 	echo "$(GREEN)Notebook genere : $$HTML$(RESET)"
 
+notebook-pdf: require-env ## Rendre un notebook en PDF  [NOTEBOOK=pipeline|test|extract|preprocess]
+	@QMD=$$(case "$(NOTEBOOK)" in \
+		pipeline)                echo "script_notebook/pipeline_gmic.qmd" ;; \
+		test|test_validation*)   echo "script_notebook/test_validation_report.qmd" ;; \
+		extract)                 echo "extraction_project/notebook/extract_download.qmd" ;; \
+		preprocess)              echo "script_notebook/preprocess_gmic.qmd" ;; \
+		*)                       echo "$(NOTEBOOK)" ;; \
+	esac); \
+	PDF=$${QMD%.qmd}.pdf; \
+	if ! command -v quarto >/dev/null 2>&1; then \
+		echo "$(YELLOW)Quarto introuvable. Installez-le : https://quarto.org/docs/get-started/$(RESET)"; exit 1; \
+	fi; \
+	if [ ! -f "$$QMD" ]; then \
+		echo "$(YELLOW)Notebook introuvable : $$QMD$(RESET)"; \
+		echo "Valeurs acceptees : pipeline, test, extract, preprocess (ou chemin direct)"; exit 1; \
+	fi; \
+	$(CONDA_RUN) python -c "import ipykernel, nbformat" >/dev/null 2>&1 || \
+		$(CONDA_RUN) python -m pip install -q ipykernel nbformat; \
+	$(CONDA_RUN) python -m ipykernel install --user --name $(NOTEBOOK_KERNEL) \
+		--display-name "Python ($(CONDA_ENV))" >/dev/null; \
+	PYTHON_BIN=$$(conda run -n $(CONDA_ENV) python -c "import sys; print(sys.executable)"); \
+	echo "$(YELLOW)Rendu du notebook : $$QMD$(RESET)"; \
+	GMIC_OUTPUT_DIR=$(OUTPUT_DIR) QUARTO_PYTHON=$$PYTHON_BIN quarto render $$QMD \
+		--to pdf --execute --no-execute-daemon; \
+	echo "$(GREEN)Notebook genere : $$PDF$(RESET)"
+
 notebook-serve: require-env ## Re-executer un notebook et le servir en live (quarto preview)  [NOTEBOOK=pipeline|test|...]
 	@QMD=$$(case "$(NOTEBOOK)" in \
-		pipeline)   echo "script_notebook/pipeline_gmic.qmd" ;; \
-		test)       echo "script_notebook/test_validation_report.qmd" ;; \
-		extract)    echo "extraction_project/notebook/extract_download.qmd" ;; \
-		preprocess) echo "script_notebook/preprocess_gmic.qmd" ;; \
+		pipeline)                echo "script_notebook/pipeline_gmic.qmd" ;; \
+		test|test_validation*)   echo "script_notebook/test_validation_report.qmd" ;; \
+		extract)                 echo "extraction_project/notebook/extract_download.qmd" ;; \
+		preprocess)              echo "script_notebook/preprocess_gmic.qmd" ;; \
 		*)          echo "$(NOTEBOOK)" ;; \
 	esac); \
 	if [ ! -f "$$QMD" ]; then \

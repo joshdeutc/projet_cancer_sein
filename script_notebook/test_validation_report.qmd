@@ -1,30 +1,51 @@
 ---
 title: "Rapport de validation — tests et donnees"
+subtitle: "Ce que verifie le pipeline avant de toucher a vos images"
 format:
   html:
     toc: true
-    code-fold: false
+    toc-depth: 3
     theme: cosmo
 execute:
-  echo: true
+  echo: false
   warning: false
 ---
 
-Ce notebook contient deux parties :
+```{python}
+import os, sys, tempfile, subprocess
+import cv2, numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from IPython.display import Markdown, display as ipy_display
 
-1. **Le validateur fonctionne-t-il ?** — Tests unitaires sur des images synthetiques pour verifier que le code detecte bien chaque cas problematique.
-2. **Mes donnees sont-elles pretes ?** — Validation de vraies images (`data/test_images/`) pour voir ce que le pipeline recevra.
+sys.path.insert(0, "/root/projet_cancer_sein/scripts")
+from validate_input import ValidationResult, check_image
+
+tmp = tempfile.mkdtemp()
+REAL_MAMMO = "/root/projet_cancer_sein/data/demo/train_images/13101/447716546.png"
+```
+
+Ce notebook couvre deux questions independantes :
+
+1. **Le validateur fonctionne-t-il ?** — Tests unitaires sur des images synthetiques,
+   l'equivalent de `make test`.
+2. **Mes donnees sont-elles pretes ?** — Validation de vraies images depuis
+   `data/test_images/`, l'equivalent de `make validate`.
 
 ---
 
-## Partie 1 — Le validateur fonctionne-t-il ?
+## Partie 1 — Tests unitaires
 
-On lance les memes tests que `make test` et on visualise chaque cas.
+### Ce que teste `make test`
+
+`make test` lance `pytest tests/` sur deux fonctions de
+[`scripts/validate_input.py`](../scripts/validate_input.py) :
+`check_csv()` et `check_image()`. Chaque test fabrique une situation
+problematique precise et verifie que le validateur la detecte.
 
 ### Resultat pytest
 
 ```{python}
-import subprocess
 result = subprocess.run(
     ["python", "-m", "pytest", "tests/", "-v", "--tb=short"],
     capture_output=True, text=True,
@@ -35,162 +56,144 @@ if result.returncode != 0:
     print(result.stderr)
 ```
 
----
+### Tests CSV — ce qui est verifie
 
-### Tests CSV
+`check_csv()` lit votre `train.csv` et controle quatre points :
 
-Le validateur verifie que le fichier `train.csv` est lisible, complet et coherent.
+```python
+# validate_input.py · lignes 99–125
+missing = EXPECTED_CSV_COLS - columns        # colonnes obligatoires presentes ?
+bad_lat = set(df["laterality"]) - {"L","R"}  # lateralite = L ou R uniquement
+bad_view = set(df["view"]) - {"CC","MLO"}    # vue = CC ou MLO uniquement
+cancer_vals.issubset({0, 1})                 # label cancer = 0 ou 1 uniquement
+```
 
-| Test | Ce qui est simule | Resultat attendu |
+| Test | Situation simulee | Resultat attendu |
 |------|-------------------|------------------|
-| `test_valid_csv` | CSV correct avec 8 lignes, colonnes valides | `passed=True`, 8 lignes lues |
-| `test_missing_csv` | Chemin vers un fichier inexistant | `passed=False`, erreur « introuvable » |
-| `test_csv_is_a_directory` | Un **dossier** nomme `train.csv` (cas reel rencontre sur le poste) | `passed=False`, erreur « dossier » |
-| `test_missing_columns` | CSV avec seulement `patient_id` et `image_id` | `passed=False`, erreur « Colonnes manquantes » |
-| `test_invalid_laterality` | Valeur `Left` au lieu de `L` | `passed=False`, erreur « Lateralites invalides » |
-| `test_invalid_view` | Valeur `XRAY` au lieu de `CC` ou `MLO` | `passed=False`, erreur « Vues invalides » |
+| `test_valid_csv` | CSV correct, 8 lignes, toutes colonnes | `passed=True` |
+| `test_missing_csv` | Chemin inexistant | Erreur « introuvable » |
+| `test_csv_is_a_directory` | Un *dossier* nomme `train.csv` | Erreur « dossier » |
+| `test_missing_columns` | Seulement `patient_id` et `image_id` | Erreur « Colonnes manquantes » |
+| `test_invalid_laterality` | Valeur `Left` au lieu de `L` | Erreur « Lateralites invalides » |
+| `test_invalid_view` | Valeur `XRAY` au lieu de `CC`/`MLO` | Erreur « Vues invalides » |
 
----
+: {tbl-colwidths="[30,45,25]"}
 
-### Tests images
+### Tests images — ce qui est verifie
 
-Pour chaque cas, une image est generee (ou lue depuis `data/demo`) et soumise au validateur.
+`check_image()` applique trois criteres sur chaque image :
 
-**Seuils appliques :**
+```python
+# validate_input.py · lignes 168–208
+if img.shape[2] == 3:           # couleur RGB → rejet immediat
+if h < 700 or w < 700:         # trop petite → warning (pipeline continue)
+if max(h, w) > 5000:           # tres grande → warning
+if (pmax - pmin) < 50:         # uniforme (noire/blanche) → rejet (image corrompue)
+```
 
-- **Taille recommandee : 700 x 700 px** — en dessous, warning (le pipeline continue).
-- **Warning > 5000 px sur une dimension** — l'image est acceptee mais un avertissement est emis.
-- **Image uniforme** (toute noire ou toute blanche) : rejetee si l'ecart min-max < 50.
+> Les seuils (`MIN_IMAGE_SIZE=700`, `MIN_PIXEL_RANGE=50`, `VERY_LARGE_DIM=5000`)
+> sont definis aux lignes 25–27 de `validate_input.py` — modifiables si besoin.
 
 ```{python}
-import os, sys, tempfile
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-
-sys.path.insert(0, "/root/projet_cancer_sein/scripts")
-from validate_input import ValidationResult, check_image
-
-tmp = tempfile.mkdtemp()
-
-REAL_MAMMO = "/root/projet_cancer_sein/data/demo/train_images/13101/447716546.png"
-
 cases = []
 
-# 1. Vraie mammographie (uint16, depuis data/demo)
-img = cv2.imread(REAL_MAMMO, cv2.IMREAD_UNCHANGED)
-cases.append(("Vraie mammo\n(uint16, 3328x2560)", img, "valide"))
+img = cv2.imread(REAL_MAMMO, cv2.IMREAD_UNCHANGED) if os.path.isfile(REAL_MAMMO) else np.random.randint(10, 240, (3000, 2000), dtype=np.uint16)
+cases.append(("Vraie mammo\n(uint16)", img, "valide"))
 
-# 2. Uint8 valide (distribution 0-255, entiers)
-img = np.random.randint(0, 256, (3000, 2000), dtype=np.uint8)
-cases.append(("Grayscale 8 bits\n(pixels 0-255, uint8)", img, "valide"))
+cases.append(("Grayscale uint8\n(0-255)", np.random.randint(0, 256, (3000, 2000), dtype=np.uint8), "valide"))
+cases.append(("Couleur RGB\n(photo classique)", np.random.randint(0, 255, (3000, 2000, 3), dtype=np.uint8), "erreur"))
+cases.append(("Trop petite\n(400x350 px)", np.random.randint(10, 240, (400, 350), dtype=np.uint8), "warning"))
+cases.append(("Toute noire\n(image vide)", np.zeros((3000, 2000), dtype=np.uint8), "erreur"))
+cases.append(("Toute blanche\n(uniforme)", np.full((3000, 2000), 255, dtype=np.uint8), "erreur"))
+cases.append(("Tres grande\n(6000x2000 px)", np.random.randint(10, 240, (6000, 2000), dtype=np.uint8), "warning"))
 
-# 3. RGB
-img = np.random.randint(0, 255, (3000, 2000, 3), dtype=np.uint8)
-cases.append(("Image couleur RGB\n(photo classique)", img, "erreur"))
-
-# 4. Petite (warning seulement, pas erreur)
-img = np.random.randint(10, 240, (400, 350), dtype=np.uint8)
-cases.append(("Petite\n(400x350 px < 700)", img, "warning"))
-
-# 5. Toute noire
-img = np.zeros((3000, 2000), dtype=np.uint8)
-cases.append(("Toute noire\n(corrompue / vide)", img, "erreur"))
-
-# 6. Toute blanche
-img = np.full((3000, 2000), 255, dtype=np.uint8)
-cases.append(("Toute blanche\n(uniforme = invalide)", img, "erreur"))
-
-# 7. Tres grande (warning, pas erreur)
-img = np.random.randint(10, 240, (6000, 2000), dtype=np.uint8)
-cases.append(("Tres grande\n(6000x2000 > 5000)", img, "warning"))
-
-fig, axes = plt.subplots(1, len(cases), figsize=(20, 4))
-fig.suptitle("Le validateur detecte-t-il correctement chaque cas ?", fontsize=13, weight="bold")
+n_cases = len(cases)
+fig, axes = plt.subplots(1, n_cases, figsize=(3 * n_cases, 5))
+fig.suptitle("Le validateur detecte-t-il correctement chaque cas ?", fontsize=13, weight="bold", y=1.01)
 
 for ax, (title, img_array, expected) in zip(axes, cases):
-    fname = title[:12].replace("\n", "_").replace(" ", "_").replace("x", "x") + ".png"
+    fname = title[:10].replace("\n","_").replace(" ","_") + ".png"
     path = os.path.join(tmp, fname)
     cv2.imwrite(path, img_array)
-    result = ValidationResult()
-    ok = check_image(path, result)
+    res = ValidationResult()
+    check_image(path, res)
 
-    display = img_array if img_array.ndim == 2 else img_array[:, :, ::-1]
-    cmap = "gray" if display.ndim == 2 else None
-    thumb = display[::max(1, display.shape[0]//100), ::max(1, display.shape[1]//100)]
+    display = img_array if img_array.ndim == 2 else img_array[:,:,::-1]
+    thumb = display[::max(1,display.shape[0]//100), ::max(1,display.shape[1]//100)]
     vmax = 65535 if display.dtype == np.uint16 else 255
-    ax.imshow(thumb, cmap=cmap, aspect="auto", vmin=0, vmax=vmax)
-    ax.set_title(title, fontsize=8)
+    ax.imshow(thumb, cmap="gray" if display.ndim==2 else None, aspect="auto", vmin=0, vmax=vmax)
+    ax.set_title(title, fontsize=8, pad=4)
 
-    if result.errors:
-        status = "❌ REJETE"
-        color = "#e74c3c"
-        msg = result.errors[0][:45] + "…"
-    elif result.warnings:
-        status = "⚠️ WARNING"
-        color = "#f39c12"
-        msg = result.warnings[0][:45] + "…"
+    if res.errors:
+        status, color, msg = "REJETE", "#e74c3c", res.errors[0][:40]
+    elif res.warnings:
+        status, color, msg = "WARNING", "#f39c12", res.warnings[0][:40]
     else:
-        status = "✅ VALIDE"
-        color = "#2ecc71"
-        msg = "OK"
+        status, color, msg = "VALIDE", "#2ecc71", "OK"
 
-    ax.set_xlabel(f"{status}\n{msg}", fontsize=7, color=color, weight="bold")
-    ax.set_xticks([])
-    ax.set_yticks([])
+    ax.text(0.5, -0.04, status, transform=ax.transAxes,
+            ha="center", va="top", fontsize=8, color=color, weight="bold")
+    ax.text(0.5, -0.12, msg, transform=ax.transAxes,
+            ha="center", va="top", fontsize=6.5, color=color, wrap=True)
+    ax.set_xticks([]); ax.set_yticks([])
     for spine in ax.spines.values():
-        spine.set_edgecolor(color)
-        spine.set_linewidth(2)
+        spine.set_edgecolor(color); spine.set_linewidth(2)
 
 plt.tight_layout()
+plt.subplots_adjust(bottom=0.18)
 plt.show()
 ```
 
-| Test | Ce qui est simule | Resultat attendu |
+| Test | Situation simulee | Resultat attendu |
 |------|-------------------|------------------|
-| `test_valid_grayscale` | Vraie mammographie uint16 depuis `data/demo` | `True`, aucune erreur |
-| `test_uint8_valid` | PNG 3000x2000 uint8, pixels 0-255 (entiers) | `True`, aucune erreur |
-| `test_rgb_image_rejected` | PNG 3000x2000 en couleur RGB | `False`, erreur « COULEUR » |
-| `test_tiny_image_warns` | PNG 400x350 px (sous le seuil 700px) | `True` mais warning « petite » |
-| `test_black_image_rejected` | PNG entierement noir (image corrompue) | `False`, erreur « uniforme » |
-| `test_white_image_rejected` | PNG entierement blanc | `False`, erreur « uniforme » |
-| `test_large_image_warns` | PNG 6000x2000 (dimension > 5000px) | `True` mais warning « grande » |
-| `test_corrupted_file` | Fichier `.png` contenant du texte brut | `False`, erreur « illisible » |
+| `test_valid_grayscale` | Vraie mammographie uint16 | Valide |
+| `test_uint8_valid` | PNG 3000x2000 uint8 | Valide |
+| `test_rgb_image_rejected` | Image couleur RGB | Erreur « COULEUR » |
+| `test_tiny_image_warns` | PNG 400x350 px | Warning « petite » |
+| `test_black_image_rejected` | PNG entierement noir | Erreur « uniforme » |
+| `test_white_image_rejected` | PNG entierement blanc | Erreur « uniforme » |
+| `test_large_image_warns` | PNG 6000x2000 | Warning « grande » |
+| `test_corrupted_file` | Fichier `.png` contenant du texte | Erreur « illisible » |
+
+: {tbl-colwidths="[30,45,25]"}
 
 ---
 
-## Partie 2 — Mes donnees sont-elles pretes ?
+## Partie 2 — Validation de vraies images
 
-Ces images de `data/test_images/` simulent ce qu'un utilisateur pourrait soumettre par erreur (photos, screenshots, fichiers web). C'est l'equivalent visuel de `make validate`.
+### Ce que fait `make validate`
+
+`make validate INPUT_DIR=...` appelle `check_csv()` puis `check_images()`
+sur vos vraies donnees. Les images ci-dessous viennent de `data/test_images/` —
+elles simulent ce qu'un utilisateur pourrait soumettre par erreur (photos,
+screenshots, fichiers web).
+
+```python
+# validate_input.py · lignes 230–254
+SUPPORTED_FORMATS   = (".png", ".dcm", ".dcm.zip")
+UNSUPPORTED_FORMATS = (".jpg", ".jpeg", ".webp", ".avif", ...)
+# Les formats non supportes sont rejetes avant meme d'ouvrir l'image.
+```
 
 ```{python}
-import os, sys
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-
-sys.path.insert(0, "/root/projet_cancer_sein/scripts")
-from validate_input import ValidationResult, check_image
-
 images_dir = "/root/projet_cancer_sein/data/test_images"
-files = sorted(os.listdir(images_dir))
+files = sorted(os.listdir(images_dir)) if os.path.isdir(images_dir) else []
 
 if not files:
     print("Aucune image dans data/test_images/")
 else:
-    SUPPORTED = (".png",)
+    SUPPORTED   = (".png",)
     UNSUPPORTED = (".jpg", ".jpeg", ".webp", ".avif", ".bmp", ".tiff", ".gif", ".heic", ".heif")
 
-    fig, axes = plt.subplots(1, len(files), figsize=(14, 5))
-    if len(files) == 1:
-        axes = [axes]
-    fig.suptitle("Vos images — le validateur les accepte-t-il ?", fontsize=12, weight="bold")
+    n_files = len(files)
+    fig, axes = plt.subplots(1, n_files, figsize=(3 * n_files, 5))
+    if n_files == 1: axes = [axes]
+    fig.suptitle("Vos images — le validateur les accepte-t-il ?", fontsize=12, weight="bold", y=1.01)
 
     for ax, fname in zip(axes, files):
         path = os.path.join(images_dir, fname)
-        ext = os.path.splitext(fname)[1].lower()
-        short_name = fname[:30] + "…" if len(fname) > 30 else fname
+        ext  = os.path.splitext(fname)[1].lower()
+        short = fname[:25] + "…" if len(fname) > 25 else fname
 
         try:
             pil_img = Image.open(path).convert("RGB")
@@ -202,34 +205,32 @@ else:
             ax.set_facecolor("#f0f0f0")
 
         if ext in UNSUPPORTED:
-            status = "❌ FORMAT NON SUPPORTE"
-            msg = f"Extension {ext} rejetee\n(seuls PNG/DICOM sont acceptes)"
-            color = "#e74c3c"
+            status, color = "FORMAT NON SUPPORTE", "#e74c3c"
+            msg = f"Extension {ext} rejetee"
         elif ext in SUPPORTED:
-            result = ValidationResult()
-            ok = check_image(path, result)
+            res = ValidationResult()
+            ok  = check_image(path, res)
             if ok:
-                status = "✅ VALIDE" if not result.warnings else "⚠️ WARNING"
-                msg = result.warnings[0][:50] if result.warnings else "Image acceptee"
-                color = "#f39c12" if result.warnings else "#2ecc71"
+                status = "VALIDE" if not res.warnings else "WARNING"
+                color  = "#f39c12" if res.warnings else "#2ecc71"
+                msg    = res.warnings[0][:40] if res.warnings else "Image acceptee"
             else:
-                status = "❌ REJETE"
-                msg = result.errors[0][:50] + "…" if result.errors else ""
-                color = "#e74c3c"
+                status, color = "REJETE", "#e74c3c"
+                msg = res.errors[0][:40] if res.errors else ""
         else:
-            status = "⚠️ INCONNU"
-            msg = f"Extension {ext} non reconnue"
-            color = "#f39c12"
+            status, color, msg = "INCONNU", "#f39c12", f"Extension {ext} non reconnue"
 
-        ax.set_title(short_name, fontsize=7.5, wrap=True)
-        ax.set_xlabel(f"{status}\n{msg}", fontsize=7.5, color=color, weight="bold")
-        ax.set_xticks([])
-        ax.set_yticks([])
+        ax.set_title(short, fontsize=7.5, pad=4)
+        ax.text(0.5, -0.04, status, transform=ax.transAxes,
+                ha="center", va="top", fontsize=8, color=color, weight="bold")
+        ax.text(0.5, -0.12, msg, transform=ax.transAxes,
+                ha="center", va="top", fontsize=6.5, color=color)
+        ax.set_xticks([]); ax.set_yticks([])
         for spine in ax.spines.values():
-            spine.set_edgecolor(color)
-            spine.set_linewidth(2.5)
+            spine.set_edgecolor(color); spine.set_linewidth(2.5)
 
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.18)
     plt.show()
 
     print("\nDIAGNOSTIC — data/test_images/\n" + "=" * 50)
@@ -238,12 +239,10 @@ else:
         if ext in UNSUPPORTED:
             verdict = f"[FAIL]  Format non supporte ({ext})"
         elif ext in SUPPORTED:
-            result = ValidationResult()
-            ok = check_image(os.path.join(images_dir, fname), result)
-            if ok and result.warnings:
-                verdict = f"[WARN]  {result.warnings[0][:70]}"
-            else:
-                verdict = "[OK]   Valide" if ok else f"[FAIL]  {result.errors[0][:70]}"
+            res = ValidationResult()
+            ok  = check_image(os.path.join(images_dir, fname), res)
+            verdict = f"[WARN]  {res.warnings[0][:70]}" if (ok and res.warnings) \
+                 else ("[OK]   Valide" if ok else f"[FAIL]  {res.errors[0][:70]}")
         else:
             verdict = f"[WARN]  Extension inconnue ({ext})"
         print(f"  {fname[:45]:<45}  {verdict}")
