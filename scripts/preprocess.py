@@ -1,5 +1,5 @@
 """
-Prétraitement GMIC — Étapes 1 à 4
+Prétraitement GMIC — Étapes 1 à 6
 -----------------------------------
 Prépare les images (DICOM ou PNG) pour l'inférence GMIC :
 
@@ -8,9 +8,17 @@ Prépare les images (DICOM ou PNG) pour l'inférence GMIC :
   3. Construction du PKL au format GMIC
   4. Recadrage (crop_mammogram.py)
   5. Redimensionnement à 2944×1920 + normalisation uint8
+  6. Flip horizontal des vues droites (R-CC, R-MLO)
 
-Le flip horizontal (vues droites) et la normalisation mean/std sont appliqués
-directement à l'inférence — inutile de les précalculer.
+GMIC a été entraîné avec tous les seins orientés vers la gauche. Les vues
+droites (R-CC, R-MLO) sont naturellement orientées à droite : on les retourne
+horizontalement UNE FOIS ici, lors du preprocessing, pour que toutes les images
+stockées soient déjà dans l'orientation attendue par le modèle.
+→ inference.py et fine_tuning/dataset.py n'ont plus besoin de gérer ce flip.
+
+Note : la normalisation mean/std (z-score) reste appliquée à la volée lors
+du chargement car elle produit des float32 négatifs — incompatibles avec le
+format PNG uint8 utilisé pour le stockage.
 
 Le dossier de sortie contiendra :
   <output-dir>/cropped_images/         <- images prêtes pour l'inférence
@@ -19,9 +27,9 @@ Le dossier de sortie contiendra :
   <output-dir>/cropped_exam_list.pkl
 
 Usage :
-  python scripts/preprocess.py --input-dir data/demo --output-dir output/demo
-  python scripts/preprocess.py --input-dir data/extract_dataset --output-dir output/dicom
-  python scripts/preprocess.py --input-dir data/demo --output-dir output/demo --force-crop
+  python scripts/preprocess.py --input-dir data/demo --output-dir preprocess_image/demo
+  python scripts/preprocess.py --input-dir data/extract_dataset --output-dir preprocess_image/dicom
+  python scripts/preprocess.py --input-dir data/demo --output-dir preprocess_image/demo --force-crop
 """
 
 import os
@@ -351,11 +359,56 @@ def _normalize_uint8(img):
     return np.zeros_like(img_f, dtype=np.uint8)
 
 
-# ── Étape 5 : get_optimal_centers ────────────────────────────────────────────
+# ── Étape 5 : Flip horizontal des vues droites ───────────────────────────────
+
+_FLIP_MARKER = ".right_views_flipped"
+_VIEWS_RIGHT = {"R-CC", "R-MLO"}
+
+
+def apply_right_view_flip(cropped_dir: str, pkl_path: str, output_dir: str):
+    """
+    Retourne horizontalement toutes les images R-CC et R-MLO dans cropped_dir.
+
+    GMIC a été entraîné avec les seins orientés à gauche. Les vues droites sont
+    naturellement orientées à droite : ce flip les aligne avec les vues gauches
+    et avec les attentes du modèle.
+
+    Idempotent : un marqueur .right_views_flipped est créé pour éviter
+    d'appliquer le flip deux fois lors d'une ré-exécution.
+    """
+    print("\n" + "=" * 60)
+    print("ETAPE 5 : Flip horizontal des vues droites (R-CC, R-MLO)")
+    print("=" * 60)
+
+    with open(pkl_path, "rb") as f:
+        exam_list = pickle.load(f)
+
+    flipped = 0
+    for exam in tqdm(exam_list, desc="Flip"):
+        for view in _VIEWS_RIGHT:
+            for sfp in exam.get(view, []):
+                path = os.path.join(cropped_dir, sfp + ".png")
+                if not os.path.exists(path):
+                    continue
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+                cv2.imwrite(path, cv2.flip(img, 1))  # 1 = axe vertical = flip horizontal
+                flipped += 1
+
+    open(os.path.join(output_dir, _FLIP_MARKER), "w").close()
+    print(f"Images retournees : {flipped}")
+
+
+def is_flip_done(output_dir: str) -> bool:
+    return os.path.exists(os.path.join(output_dir, _FLIP_MARKER))
+
+
+# ── Étape 6 : get_optimal_centers ────────────────────────────────────────────
 
 def run_optimal_centers(cropped_dir: str, pkl_cropped: str, pkl_final: str):
     print("\n" + "=" * 60)
-    print("ETAPE 5 : Calcul des centres optimaux")
+    print("ETAPE 6 : Calcul des centres optimaux")
     print("=" * 60)
 
     cmd = (
@@ -434,9 +487,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python scripts/preprocess.py --input-dir data/demo --output-dir output/demo
-  python scripts/preprocess.py --input-dir data/extract_dataset --output-dir output/dicom
-  python scripts/preprocess.py --input-dir data/demo --output-dir output/demo --force-crop
+  python scripts/preprocess.py --input-dir data/demo --output-dir preprocess_image/demo
+  python scripts/preprocess.py --input-dir data/extract_dataset --output-dir preprocess_image/dicom
+  python scripts/preprocess.py --input-dir data/demo --output-dir preprocess_image/demo --force-crop
         """,
     )
     parser.add_argument("--input-dir", required=True,
@@ -444,7 +497,7 @@ Exemples :
     parser.add_argument("--csv", default=None,
                         help="Chemin vers le CSV. Par defaut : <input-dir>/train_subset_test.csv ou train.csv")
     parser.add_argument("--output-dir", default=None,
-                        help="Dossier de sortie. Par defaut : <projet>/output/")
+                        help="Dossier de sortie. Par defaut : <projet>/preprocess_image/")
     parser.add_argument("--format", choices=["dicom", "png", "auto"], default="auto",
                         help="Format des images d'entree (defaut: auto-detection)")
     parser.add_argument("--force-crop", action="store_true",
@@ -469,7 +522,7 @@ Exemples :
 
     output_dir = args.output_dir
     if output_dir is None:
-        output_dir = os.path.join(PROJECT_DIR, "output")
+        output_dir = os.path.join(PROJECT_DIR, "preprocess_image")
     output_dir = os.path.abspath(output_dir)
 
     png_dir = os.path.join(output_dir, "png_images")
@@ -507,6 +560,10 @@ Exemples :
     build_exam_pkl(csv_path, source_png_dir, pkl_raw)
 
     if args.force_crop:
+        # Nouveau crop → les images sont fraîches et non retournées : réinitialiser le marqueur
+        marker = os.path.join(output_dir, _FLIP_MARKER)
+        if os.path.exists(marker):
+            os.remove(marker)
         run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped)
     elif is_crop_done(cropped_dir, pkl_cropped):
         n = _count_pngs(cropped_dir)
@@ -515,11 +572,18 @@ Exemples :
         run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped)
 
     if args.force_resize:
+        # Resize en place : l'orientation des images ne change pas.
+        # Ne pas toucher au marqueur de flip pour eviter un double flip.
         resize_all(cropped_dir, pkl_cropped)
     elif is_resize_done(cropped_dir, pkl_cropped):
         print(f"[AUTO] Resize : images deja en {GMIC_H}x{GMIC_W} uint8 -> SKIP")
     else:
         resize_all(cropped_dir, pkl_cropped)
+
+    if is_flip_done(output_dir):
+        print(f"[AUTO] Flip vues droites : deja applique -> SKIP")
+    else:
+        apply_right_view_flip(cropped_dir, pkl_cropped, output_dir)
 
     if is_final_done(pkl_final):
         print(f"[AUTO] PKL final : {pkl_final} deja present -> SKIP")

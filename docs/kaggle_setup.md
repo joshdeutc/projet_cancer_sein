@@ -70,7 +70,7 @@ data/
 Une fois les données téléchargées :
 
 ```bash
-make run INPUT_DIR=data OUTPUT_DIR=output/rsna
+make run INPUT_DIR=data OUTPUT_DIR=preprocess_image/rsna
 ```
 
 ---

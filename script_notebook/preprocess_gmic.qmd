@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(PROJECT_DIR, "GMIC"))
 GMIC_H, GMIC_W = 2944, 1920
 VIEWS      = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
 
-raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or "output/demo"
+raw_param  = os.environ.get("GMIC_OUTPUT_DIR") or "preprocess_image/demo"
 OUTPUT_DIR = raw_param if os.path.isabs(raw_param) else os.path.join(PROJECT_DIR, raw_param)
 
 CROPPED_DIR = os.path.join(OUTPUT_DIR, "cropped_images")

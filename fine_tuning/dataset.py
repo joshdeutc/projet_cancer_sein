@@ -99,6 +99,9 @@ class MammographyExamDataset(Dataset):
         import imageio
         image = np.array(imageio.imread(png_path), dtype=np.float32)
 
+        # Les vues droites ont deja ete retournees lors du preprocessing.
+        # Ici on applique uniquement resize + normalisation.
+
         # Redimensionnement via PIL (interp. bilinéaire)
         from PIL import Image
         pil_img = Image.fromarray(image)

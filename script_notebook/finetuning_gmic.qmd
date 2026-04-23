@@ -1,0 +1,898 @@
+---
+title: "Fine-tuning GMIC — Comprendre l'architecture"
+subtitle: "De la theorie du transfer learning au code de ce depot"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+jupyter: gmic
+---
+
+```{python}
+#| echo: false
+import os
+import sys
+import pickle
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+from IPython.display import Markdown, display as ipy_display
+
+warnings.filterwarnings("ignore")
+
+
+def _find_root(start: str) -> str:
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, "fine_tuning")) and os.path.isdir(os.path.join(cur, "scripts")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+
+PROJECT_DIR = _find_root(os.getcwd())
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+from fine_tuning.config import (
+    RUN_NAME, RUN_DIR, EXAM_LIST_PATH, IMAGE_DIR, IMAGE_SIZE,
+    CHECKPOINT_DIR, BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
+    WEIGHT_DECAY, VAL_SPLIT, RANDOM_SEED, DEVICE,
+)
+
+CACHE_PATH      = os.path.join(CHECKPOINT_DIR, "features.pt")
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "head_best.pt")
+
+def _rel(path): return os.path.relpath(path, PROJECT_DIR)
+```
+
+# Partie I — Comprendre le probleme
+
+## 1. Le contexte : on a un gros modele pre-entraine et peu de donnees
+
+Le point de depart de ce projet est **GMIC**, un reseau de neurones convolutif
+entraine par des chercheurs NYU sur des centaines de milliers de mammographies
+annotees. GMIC sait deja *extraire de l'information* a partir d'une mammographie.
+
+Mais GMIC a ete entraine sur **leurs** donnees : leur scanner, leur population,
+leur protocole d'acquisition. On veut qu'il marche sur **nos** donnees. On a
+typiquement quelques dizaines a quelques centaines d'examens annotes, avec **tres
+peu de cas positifs** (le cancer est rare, c'est heureux medicalement mais
+embetant statistiquement).
+
+Le probleme a resoudre peut s'enoncer ainsi :
+
+> *Comment adapter un modele riche (des millions de parametres) a un petit
+> dataset (quelques dizaines d'exemples, dont une poignee de positifs) sans
+> qu'il surapprenne (overfit) ?*
+
+C'est precisement la question a laquelle repond le **transfer learning**.
+
+## 2. Le transfer learning : trois strategies
+
+Le transfer learning, c'est l'idee de reutiliser un modele deja entraine sur
+une tache proche plutot que de partir de zero. Il y a trois strategies
+classiques, du plus agressif au plus conservateur :
+
+| Strategie | Ce qu'on entraine | Quand l'utiliser |
+|-----------|-------------------|------------------|
+| **Full fine-tuning** | Tous les poids du reseau | Beaucoup de donnees, tache tres differente |
+| **Partial fine-tuning** | Les dernieres couches seulement | Donnees moyennes, tache similaire |
+| **Feature extraction** | Une petite tete ajoutee au bout | Peu de donnees, tache tres similaire |
+
+Le critere decisif, c'est le **ratio parametres / exemples positifs**. Plus ce
+ratio est eleve, plus on risque le surapprentissage : le modele apprend par
+coeur les exemples d'entrainement au lieu de generaliser.
+
+**Regle intuitive** : on veut que le nombre de parametres a apprendre reste
+petit devant le nombre d'exemples disponibles. Avec seulement quelques cancers
+dans le dataset, on ne peut pas se permettre d'entrainer des millions de
+parametres.
+
+C'est pour ca que ce projet utilise la **feature extraction**.
+
+## 3. Feature extraction : l'idee en une phrase
+
+> *On gele completement GMIC, on utilise ses sorties comme des "features"
+> (descripteurs), et on entraine un tres petit modele par-dessus pour prendre
+> la decision finale.*
+
+Concretement :
+
+```text
+  Image                                            Score
+  mammo   ---->  [ GMIC gele ]  ---->  features  --->  cancer
+ (entree)         (non-appris)        (8 nombres)      (sortie)
+                                          |
+                                          v
+                                [ tete MLP entrainable ]
+                                 (~150 parametres)
+```
+
+GMIC fait le gros du travail (reconnaitre des formes, des textures, des
+calcifications). La tete se contente d'apprendre comment *combiner* ces
+indices pour donner une decision sur l'examen complet (4 vues).
+
+L'enjeu du reste du document est de comprendre **chaque morceau** de ce
+pipeline, et **pourquoi** il est fait ainsi.
+
+---
+
+# Partie II — Architecture du modele
+
+## 4. GMIC comme extracteur de features
+
+GMIC prend en entree **une image** (une seule vue : par exemple L-CC = sein
+gauche vu d'en haut) et produit en sortie **deux nombres** :
+
+- `P(benin)` : probabilite que la lesion soit benigne
+- `P(malin)` : probabilite que la lesion soit maligne
+
+Ces deux nombres sont le resume de tout ce que GMIC a vu sur l'image. On ne
+cherche pas a comprendre comment il les calcule en interne : on les prend
+comme des **descripteurs**, des nombres qui resument l'image.
+
+Un examen complet contient 4 vues (L-CC, L-MLO, R-CC, R-MLO). Si on passe
+chacune des 4 vues dans GMIC, on obtient :
+
+$$
+\underbrace{[P(\text{benin})_{\text{L-CC}},\, P(\text{malin})_{\text{L-CC}}]}_{\text{2 valeurs}},\ \underbrace{[\ldots]_{\text{L-MLO}}}_{\text{2}},\ \underbrace{[\ldots]_{\text{R-CC}}}_{\text{2}},\ \underbrace{[\ldots]_{\text{R-MLO}}}_{\text{2}}
+$$
+
+En concatenant : **8 nombres par examen**. C'est notre vecteur de features.
+
+### Pourquoi "geler" GMIC ?
+
+Geler un modele signifie fixer tous ses poids : ils ne bougeront pas pendant
+l'entrainement. En PyTorch, cela s'exprime par deux lignes : `requires_grad = False`
+sur chaque parametre, et `model.eval()` pour desactiver dropout/batchnorm.
+
+C'est exactement ce que fait [fine_tuning/model.py:22-75](../fine_tuning/model.py#L22-L75) via
+`load_gmic_backbone` :
+
+```python
+def load_gmic_backbone(gmic_dir, image_size, device="cpu", model_idx="1"):
+    # ... construction des params GMIC ...
+    params = {
+        "device_type": "gpu" if on_gpu else "cpu",
+        "cam_size": (H // 64, W // 64),    # depend de IMAGE_SIZE
+        "K": 6, "crop_shape": (256, 256),
+        "post_processing_dim": 256, "num_classes": 2,
+        "use_v1_global": False,
+        # ...
+        "percent_t": PERCENT_T_DICT[model_idx],
+    }
+
+    model = gmic_module.GMIC(params)
+    weights_path = os.path.join(gmic_dir, "models", f"sample_model_{model_idx}.p")
+    model.load_state_dict(
+        torch.load(weights_path, map_location="cpu", weights_only=False),
+        strict=False,                      # le checkpoint a des cles en trop
+    )
+    model.eval()                           # <-- freeze 1/2 : desactive dropout/BN
+    for p in model.parameters():
+        p.requires_grad = False            # <-- freeze 2/2 : pas de gradient
+    if on_gpu:
+        model = model.cuda()
+    return model
+```
+
+Deux points subtils :
+
+- **`strict=False`** : les poids distribues par NYU contiennent des cles qui
+  n'existent plus dans la version publique du code. Sans `strict=False`, le
+  `load_state_dict` leverait une exception.
+- **`cam_size = (H // 64, W // 64)`** : GMIC attend une carte d'activation dont
+  la taille depend de l'image d'entree. Chaque dimension de `IMAGE_SIZE` doit
+  donc etre divisible par 64 (verifie par un `assert`).
+
+Trois consequences importantes :
+
+1. **Pas de gradient stocke sur ses activations** (avec `torch.no_grad()`) :
+   on economise beaucoup de memoire GPU.
+2. **Ses sorties sont deterministes** : pour une image donnee, la sortie
+   de GMIC sera toujours exactement la meme — ce qui permet de les
+   pre-calculer une seule fois (voir ci-dessous).
+3. **Aucun risque d'overfit sur GMIC** : ses millions de parametres restent
+   intouches, on ne peut pas les "casser" avec trop peu de donnees.
+
+### Consequence directe du gel : le cache de features
+
+Puisque GMIC est gele, sa sortie sur une image donnee ne changera **jamais**.
+Formellement : soit $f_{\text{GMIC}}$ la fonction calculee par GMIC. Tant que
+ses poids ne changent pas, pour toute image $x$ :
+
+$$
+f_{\text{GMIC}}(x) = \text{constante dependant uniquement de } x
+$$
+
+On peut donc calculer les 8 features de chaque examen **une seule fois** et
+les stocker sur disque dans `features.pt`. L'entrainement n'a ensuite plus
+jamais besoin de toucher a GMIC :
+
+| Sans cache (naif) | Avec cache |
+|-------------------|------------|
+| A chaque epoch : forward GMIC complet (lent) + forward tete | Une seule fois : forward GMIC, sauvegarde |
+| Repete NUM_EPOCHS fois | Puis a chaque epoch : forward tete seul (~instantane) |
+
+Le coeur du travail se passe dans [fine_tuning/features.py:43-54](../fine_tuning/features.py#L43-L54) :
+
+```python
+def _extract_exam_features(gmic, images, device):
+    """
+    images : Tensor (4, H, W) — un exam (4 vues), deja normalise par le dataset
+    returns: Tensor (8,) — concat des sorties GMIC des 4 vues
+    """
+    feats = []
+    with torch.no_grad():                              # pas de graphe autograd
+        for v in range(4):
+            x = images[v].unsqueeze(0).unsqueeze(0).to(device)   # (1, 1, H, W)
+            out = gmic(x).cpu().squeeze(0)             # (2,) = [P(benin), P(mal)]
+            feats.append(out)
+    return torch.cat(feats, dim=0)                     # (8,)
+```
+
+Deux details importants :
+
+- **`torch.no_grad()`** : puisque GMIC est gele, on ne veut pas construire le
+  graphe de calcul. Cela economise enormement de memoire GPU (les activations
+  intermediaires ne sont pas gardees en memoire).
+- **`unsqueeze(0).unsqueeze(0)`** : GMIC attend une entree `(B, C, H, W)`.
+  On a une image `(H, W)`, il faut ajouter la dimension batch et la dimension
+  canal (les mammographies sont en niveaux de gris = 1 canal).
+
+La boucle complete d'extraction est dans
+[fine_tuning/features.py:57-141](../fine_tuning/features.py#L57-L141) :
+
+```python
+def extract_and_cache(device=None, force=False, max_exams=None):
+    dataset = MammographyExamDataset(
+        exam_list=all_exams, image_dir=IMAGE_DIR,
+        image_size=IMAGE_SIZE, augment=False,
+    )
+    gmic = load_gmic_backbone(GMIC_DIR, IMAGE_SIZE, device=device)
+
+    features = torch.zeros(len(dataset), 8, dtype=torch.float32)
+    labels   = torch.zeros(len(dataset), dtype=torch.float32)
+
+    for i in tqdm(range(len(dataset)), desc="GMIC forward"):
+        imgs, lbl = dataset[i]                         # (4, H, W), scalaire
+        features[i] = _extract_exam_features(gmic, imgs, device)
+        labels[i]   = lbl
+
+    cache = {
+        "features": features, "labels": labels,
+        "image_size": tuple(IMAGE_SIZE),
+        "run_name": RUN_NAME,
+        "exam_list_path": EXAM_LIST_PATH,
+        "data_mtime": os.path.getmtime(EXAM_LIST_PATH),
+    }
+    torch.save(cache, CACHE_PATH)
+```
+
+**Quand invalider le cache ?** Le cache est recalcule automatiquement si
+`IMAGE_SIZE` change, si on change de `RUN_NAME`, ou si `data.pkl` a ete
+regenere. Pour forcer : `python -m fine_tuning.features --force`.
+
+## 5. La tete : un petit MLP entrainable
+
+La tete (`FineTuneHead` dans [fine_tuning/model.py:78-99](../fine_tuning/model.py#L78-L99))
+est un **perceptron multi-couches** (MLP) tres simple. Le code tient en une
+dizaine de lignes :
+
+```python
+class FineTuneHead(nn.Module):
+    def __init__(self, in_dim=8, hidden_dim=16, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),   # 8 -> 16
+            nn.ReLU(),                        # non-linearite
+            nn.Dropout(dropout),              # regularisation (train only)
+            nn.Linear(hidden_dim, 1),         # 16 -> 1 logit
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features).squeeze(-1)   # (B, 1) -> (B,)
+```
+
+Schematiquement :
+
+```text
+  features (8)  --> Linear(8 -> 16)  --> ReLU  --> Dropout(0.3)  --> Linear(16 -> 1)  --> logit
+```
+
+Le `.squeeze(-1)` est important : `nn.Linear(16, 1)` renvoie un tenseur de
+shape `(B, 1)`, mais `BCEWithLogitsLoss` attend des shapes alignees avec les
+labels `(B,)`. On enleve la derniere dimension.
+
+Compte des parametres :
+
+- `Linear(8 -> 16)` : 8 x 16 poids + 16 biais = **144 parametres**
+- `Linear(16 -> 1)` : 16 x 1 poids + 1 biais = **17 parametres**
+- **Total : 161 parametres entrainables**
+
+### Pourquoi cette taille precisement ?
+
+Avec tres peu d'exemples positifs, on ne peut se permettre qu'un **modele
+tres petit**. Une regle pragmatique (pas une loi physique) est d'avoir
+**au moins autant d'exemples positifs que de parametres / (10 a 100)**.
+Ici, 161 parametres, c'est deja optimiste.
+
+On ajoute deux garde-fous contre l'overfit :
+
+- **`Dropout(0.3)`** : a chaque passe d'entrainement, 30% des 16 neurones
+  caches sont aleatoirement desactives. Cela empeche le reseau de dependre
+  trop fortement d'un neurone particulier.
+- **`weight_decay=1e-5`** (dans l'optimiseur) : ajoute une penalisation L2
+  sur les poids. Les poids grands sont "tires" vers zero.
+
+### Pourquoi ReLU entre les deux couches lineaires ?
+
+Sans non-linearite entre deux `Linear`, elles sont equivalentes a une seule
+couche lineaire (composition de fonctions lineaires = fonction lineaire).
+La ReLU `f(x) = max(0, x)` introduit la non-linearite necessaire pour
+apprendre des combinaisons complexes des features.
+
+### Pourquoi 1 logit en sortie et pas une probabilite ?
+
+La derniere couche produit un **logit** : un reel entre $-\infty$ et $+\infty$.
+On *pourrait* ajouter un sigmoide pour obtenir une probabilite dans $[0, 1]$,
+mais on ne le fait pas ici. Raison : la fonction de perte utilisee
+(`BCEWithLogitsLoss`, section 8) applique elle-meme le sigmoide en interne,
+de maniere **numeriquement plus stable**. Splitter sigmoide + BCE en deux
+etapes peut causer des underflows dans les gradients.
+
+## 6. Schema global du flux
+
+```text
+         +----------------------+      +----------------------+
+         | 4 images (4 vues)    |      | Frozen: no gradient  |
+         |  tensor (4, H, W)    |      |  no parameter update |
+         +----------+-----------+      +----------------------+
+                    |
+                    v
+         +----------------------+
+         |     GMIC (gele)      |   <-- chaque vue passee independamment
+         |   Conv, attention,   |       dans le meme modele
+         |   pooling, ...       |
+         +----------+-----------+
+                    |
+                    v
+         +----------------------+
+         | 4 x [P(benin), P(mal)]|   4 vues x 2 valeurs
+         +----------+-----------+
+                    |  concat
+                    v
+         +----------------------+
+         |  features (8,)       |   vecteur de 8 nombres
+         +----------+-----------+
+                    |
+                    v
+         +----------------------+
+         |  FineTuneHead        |   SEULE partie entrainable
+         |  Linear(8 -> 16)     |   ~150 parametres
+         |  ReLU                |
+         |  Dropout(0.3)        |
+         |  Linear(16 -> 1)     |
+         +----------+-----------+
+                    |
+                    v
+               logit (1,)
+                    |
+                    | sigmoid (au moment de l'evaluation)
+                    v
+              P(cancer) in [0, 1]
+```
+
+Le message central : **95% du reseau est gele, on entraine seulement la
+derniere boite**. Tout le fine-tuning consiste a trouver les ~150 bons
+parametres de la tete.
+
+---
+
+# Partie III — Optimisations pratiques
+
+## 7. Le desequilibre de classes : pourquoi c'est un probleme
+
+Dans un dataset de mammographies, les cas sains sont tres majoritaires
+(typiquement > 95%). Un modele entraine naivement peut apprendre a toujours
+predire "sain" : il aura 95% d'accuracy et sera medicalement inutile.
+
+Il y a trois familles de solutions, qu'il ne faut **pas combiner naivement**
+(sinon on sur-corrige) :
+
+### 7.1 Re-ponderation de la perte (`pos_weight`)
+
+On multiplie la perte sur les cas positifs par un facteur > 1. En pratique
+`pos_weight = n_neg / n_pos`.
+
+### 7.2 Re-echantillonnage (`WeightedRandomSampler`)
+
+On tire aleatoirement plus souvent les cas positifs pendant la construction
+des batchs, de sorte que chaque batch contienne **~50% positifs / 50% negatifs**.
+
+C'est la strategie choisie ici. Mathematiquement, chaque exemple a un poids :
+
+$$
+w_i = \begin{cases} 1/n_{\text{pos}} & \text{si } y_i = 1 \\ 1/n_{\text{neg}} & \text{si } y_i = 0 \end{cases}
+$$
+
+puis on tire les exemples proportionnellement a $w_i$ (avec remise).
+
+C'est exactement ce que fait [fine_tuning/train.py:61-68](../fine_tuning/train.py#L61-L68) :
+
+```python
+def _make_balanced_sampler(labels):
+    y = labels.numpy().astype(int)
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    w_pos = 1.0 / n_pos if n_pos > 0 else 0.0
+    w_neg = 1.0 / n_neg if n_neg > 0 else 0.0
+    weights = [w_pos if lbl == 1 else w_neg for lbl in y]
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+```
+
+Note : `num_samples=len(weights)` signifie qu'on tire **autant d'exemples qu'il
+y en a dans le dataset**. Avec `replacement=True`, les rares positifs seront
+**re-tires plusieurs fois par epoch** — c'est ce qui equilibre le batch.
+
+### 7.3 Focal Loss
+
+Une perte modifiee qui concentre l'apprentissage sur les exemples "difficiles"
+(pour lesquels le modele se trompe). Utile quand 1 et 2 ne suffisent pas.
+
+### Pourquoi `WeightedRandomSampler` seul dans ce projet ?
+
+- Le sampler garantit que chaque batch contient un signal positif : le
+  gradient n'est jamais "ecrase" par une majorite de negatifs.
+- Ajouter `pos_weight` **en plus** doublerait la correction et pourrait
+  rendre l'entrainement instable (gradients trop grands sur les rares
+  positifs presents).
+- Focal Loss est un outil plus avance, a garder si le sampler seul ne
+  suffit pas.
+
+C'est pour cela que `fine_tuning/loss.py` utilise la BCE standard, sans
+`pos_weight`.
+
+## 8. La fonction de perte : binary cross-entropy
+
+Pour la classification binaire, la perte canonique est la **binary cross-entropy**
+(entropie croisee binaire). Pour un exemple avec logit $z$ et label $y \in \{0, 1\}$ :
+
+$$
+\text{BCE}(z, y) = - \left[ y \cdot \log \sigma(z) + (1 - y) \cdot \log(1 - \sigma(z)) \right]
+$$
+
+ou $\sigma(z) = 1 / (1 + e^{-z})$ est la fonction sigmoide.
+
+**Interpretation** : la perte est nulle quand le modele predit avec certitude
+la bonne classe, et tend vers l'infini quand il predit avec certitude la
+mauvaise classe.
+
+### Pourquoi `BCEWithLogitsLoss` plutot que `BCELoss` ?
+
+`BCEWithLogitsLoss` combine $\sigma$ et la BCE en une seule expression
+numeriquement stable. Mathematiquement equivalent, mais evite les problemes
+quand $\sigma(z)$ est tres proche de 0 ou 1 (log(0) = -inf).
+
+C'est la raison pour laquelle la tete renvoie **un logit** (pas une
+probabilite) : on laisse la perte faire le sigmoide en interne.
+
+Le fichier [fine_tuning/loss.py](../fine_tuning/loss.py) est minimaliste — un
+simple factory qui instancie la perte :
+
+```python
+import torch.nn as nn
+
+def make_loss():
+    """Renvoie la fonction de perte utilisee pour l'entrainement."""
+    return nn.BCEWithLogitsLoss()
+```
+
+Aucun argument : ni `pos_weight`, ni `reduction` customise. Le contrat entre
+modele, perte et sampler est simple et coherent :
+
+- Modele : renvoie un logit brut (pas de sigmoide en sortie)
+- Sampler : batch equilibre (50/50)
+- Perte : BCE avec sigmoide interne, pas de reponderation
+
+
+---
+
+# Partie IV — L'entrainement
+
+## 9. Split train / validation stratifie
+
+On divise le dataset en deux :
+
+- **Train** : sert a apprendre les parametres de la tete.
+- **Validation** : sert a mesurer la performance du modele sur des donnees
+  *qu'il n'a jamais vues*, pour detecter l'overfit et choisir le meilleur
+  checkpoint.
+
+### Pourquoi stratifier ?
+
+Si le dataset contient 95% de sains et 5% de cancers, un split purement
+aleatoire avec `VAL_SPLIT=0.2` pourrait donner, par malchance, un jeu de
+validation **sans aucun cancer**. On ne pourrait alors plus calculer l'AUC-ROC.
+
+Un **split stratifie** garantit que la proportion cancer/sain est respectee
+dans les deux splits. On utilise `sklearn.model_selection.train_test_split`
+avec `stratify=labels`.
+
+### Pourquoi fixer `RANDOM_SEED` ?
+
+Pour la reproductibilite : sans seed fixe, deux executions du meme script
+produisent des splits differents, donc des resultats differents. Avec
+`RANDOM_SEED=42` (par exemple), toute personne qui relance le code obtient
+**exactement le meme split**.
+
+Dans le code ([fine_tuning/train.py:44-58](../fine_tuning/train.py#L44-L58)) :
+
+```python
+def _split_indices(labels):
+    """Split stratifie (ou aleatoire si trop peu de positifs)."""
+    n = len(labels)
+    y = labels.numpy().astype(int)
+    n_pos = int(y.sum())
+    n_neg = n - n_pos
+    can_stratify = n_pos >= 2 and n_neg >= 2      # sklearn exige >=2 par classe
+
+    idx_train, idx_val = train_test_split(
+        np.arange(n),                              # on split des INDICES
+        test_size=VAL_SPLIT,
+        stratify=y if can_stratify else None,
+        random_state=RANDOM_SEED,                  # <-- reproductibilite
+    )
+    return idx_train, idx_val
+```
+
+On splitte des **indices** et non les features directement : on recupere
+ensuite `X_train = features[idx_train]` etc. C'est plus flexible (meme split
+reutilisable pour differents jeux de features).
+
+## 10. La boucle d'entrainement : forward, loss, backward, step
+
+C'est le coeur de l'entrainement. Le code reel se trouve dans
+[fine_tuning/train.py:134-162](../fine_tuning/train.py#L134-L162). Il se
+deroule en 4 etapes pour chaque batch :
+
+```python
+best_auc = -1.0
+for epoch in range(1, NUM_EPOCHS + 1):
+    model.train()                                # active Dropout
+    total, n = 0.0, 0
+    for feats, lbls in train_loader:
+        feats = feats.to(device)
+        lbls  = lbls.to(device)
+
+        # 1. FORWARD
+        logits = model(feats)                    # (B,) logits
+
+        # 2. LOSS
+        loss = loss_fn(logits, lbls)             # BCEWithLogitsLoss
+
+        # 3. BACKWARD
+        optim.zero_grad()                        # remet les gradients a 0
+        loss.backward()                          # autograd
+
+        # 4. STEP
+        optim.step()                             # theta <- theta - lr * grad
+
+        total += loss.item() * feats.size(0)
+        n     += feats.size(0)
+    tr_loss = total / n
+
+    # --- fin de l'epoch : evaluation sur val ---
+    val_loss, val_auc, val_acc = _evaluate(model, val_loader, device)
+
+    flag = ""
+    if not np.isnan(val_auc) and val_auc > best_auc:
+        best_auc = val_auc
+        torch.save({"state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "val_auc": val_auc}, BEST_MODEL_PATH)
+        flag = "  <-- best"
+
+    print(f"Epoch {epoch:3d}/{NUM_EPOCHS}  "
+          f"train_loss={tr_loss:.4f}  val_loss={val_loss:.4f}  "
+          f"val_auc={val_auc:.4f}  val_acc={val_acc:.3f}{flag}")
+```
+
+Le checkpoint sauvegarde contient trois informations : les poids
+(`state_dict`), l'epoch ou le meilleur AUC a ete atteint, et la valeur de cet
+AUC. C'est pratique au moment du chargement pour savoir **quand** le modele
+a arrete de progresser.
+
+Chaque etape en detail :
+
+### 10.1 Forward
+
+On passe les features dans la tete et on recupere les logits. PyTorch
+construit automatiquement un **graphe de calcul** en arriere-plan, qui
+servira pour la backpropagation.
+
+### 10.2 Loss
+
+On compare logits et labels avec la BCE. On obtient un **scalaire** (la perte
+moyenne sur le batch). C'est a partir de ce scalaire que tous les gradients
+sont calcules.
+
+### 10.3 Backward
+
+`loss.backward()` declenche la **retropropagation** (backpropagation).
+Concretement : pour chaque parametre $\theta_i$ du modele, PyTorch calcule
+automatiquement $\partial \text{loss} / \partial \theta_i$ grace au graphe
+de calcul. C'est l'autograd.
+
+Point important : **les gradients s'accumulent** entre les appels a
+`backward()`. Il faut donc les remettre a zero avant chaque batch avec
+`optimizer.zero_grad()`, sinon on additionne les gradients de plusieurs
+batchs.
+
+### 10.4 Step
+
+`optimizer.step()` applique la regle de mise a jour. Pour Adam (utilise
+ici), c'est une variante de la descente de gradient avec moment et
+adaptation par parametre. Intuitivement, pour chaque parametre :
+
+$$
+\theta_i \leftarrow \theta_i - \eta \cdot \text{correction}(\nabla_{\theta_i} \text{loss})
+$$
+
+ou $\eta$ est le `LEARNING_RATE`.
+
+### 10.5 Le role du `weight_decay`
+
+Dans Adam, `weight_decay=1e-5` ajoute un terme de regularisation L2 :
+
+$$
+\theta_i \leftarrow \theta_i - \eta \cdot \left( \nabla_{\theta_i} \text{loss} + \lambda \theta_i \right)
+$$
+
+Ca tire les poids vers zero a chaque step, ce qui decourage les valeurs
+extremes (anti-overfit).
+
+## 11. Metrique de validation : pourquoi AUC-ROC et pas accuracy
+
+**Accuracy** = fraction d'exemples correctement classes.
+
+Probleme : dans un dataset desequilibre, l'accuracy est trompeuse. Un
+modele qui predit "sain" pour tout le monde a 95% d'accuracy sans jamais
+detecter un cancer.
+
+**AUC-ROC** (Area Under the ROC Curve) mesure la capacite du modele a
+**ordonner** les exemples : est-ce que les cancers recoivent, en moyenne,
+un score plus eleve que les sains ? AUC-ROC = 1.0 signifie que TOUS les
+cancers sont scores plus haut que TOUS les sains. AUC-ROC = 0.5 equivaut
+au hasard.
+
+Avantage majeur : l'AUC-ROC **ne depend pas d'un seuil de decision**. On
+mesure directement la qualite du classement, independamment du point
+ou on coupe entre "cancer" et "sain".
+
+C'est pourquoi `train.py` choisit le "meilleur" checkpoint comme celui de
+plus haute AUC-ROC sur la validation, et sauvegarde son `state_dict` dans
+`head_best.pt`.
+
+Le calcul concret de l'AUC-ROC se trouve dans la fonction `_evaluate`
+([fine_tuning/train.py:71-94](../fine_tuning/train.py#L71-L94)) :
+
+```python
+@torch.no_grad()
+def _evaluate(model, loader, device):
+    """Retourne (loss_moy, auc_roc, accuracy) sur le loader."""
+    model.eval()                                 # desactive Dropout
+    loss_fn = make_loss()
+    all_logits, all_labels, total_loss = [], [], 0.0
+    n = 0
+    for feats, lbls in loader:
+        feats = feats.to(device)
+        lbls  = lbls.to(device)
+        logits = model(feats)
+        total_loss += loss_fn(logits, lbls).item() * feats.size(0)
+        all_logits.append(logits.cpu())
+        all_labels.append(lbls.cpu())
+        n += feats.size(0)
+
+    logits = torch.cat(all_logits).numpy()
+    y_true = torch.cat(all_labels).numpy().astype(int)
+    probs  = 1.0 / (1.0 + np.exp(-logits))       # sigmoide manuel
+    preds  = (probs > 0.5).astype(int)
+
+    auc = roc_auc_score(y_true, probs) if len(set(y_true.tolist())) == 2 else float("nan")
+    acc = float((preds == y_true).mean())
+    return total_loss / n, auc, acc
+```
+
+Trois choses meritent l'attention :
+
+- **Le decorator `@torch.no_grad()`** : aucune graphe autograd en evaluation.
+- **`model.eval()`** : important pour Dropout, qui se comporte differemment
+  en train (30% desactives) et en eval (tous actifs, scaling compense).
+- **`roc_auc_score` est appele sur les probas continues** (pas sur les preds
+  binaires) : c'est le classement des scores qui est mesure, pas l'accuracy.
+
+## 12. Inference : comment utiliser le modele entraine
+
+Une fois l'entrainement termine, l'inference sur un nouvel examen suit
+le meme pipeline qu'a l'entrainement :
+
+```text
+  image brute (4 vues)
+       |
+       v
+  preprocessing (scripts/preprocess.py)
+       |   - crop
+       |   - resize 2944x1920
+       |   - normalisation uint8
+       |   - flip horizontal des vues droites
+       v
+  images stockees dans cropped_images/
+       |
+       v
+  forward GMIC gele (calcul des 8 features)
+       |
+       v
+  forward FineTuneHead (checkpoint head_best.pt)
+       |
+       v
+  logit --> sigmoid --> P(cancer) in [0, 1]
+```
+
+Le seuil de decision (par defaut 0.5) peut etre ajuste selon qu'on prefere
+minimiser les faux negatifs (rater un cancer) ou les faux positifs (alerter
+a tort).
+
+---
+
+# Partie V — Etat actuel du projet
+
+Cette section lit dynamiquement la configuration et les artefacts du workspace.
+
+## 13. Configuration active
+
+```{python}
+#| echo: false
+cfg = pd.DataFrame([
+    ("RUN_NAME",        RUN_NAME,                "Dossier de preprocessing actif"),
+    ("RUN_DIR",         _rel(RUN_DIR),           "Chemin relatif du run"),
+    ("EXAM_LIST_PATH",  _rel(EXAM_LIST_PATH),    "Fichier pkl des examens"),
+    ("IMAGE_DIR",       _rel(IMAGE_DIR),         "Dossier des PNG pretraites"),
+    ("IMAGE_SIZE",      str(IMAGE_SIZE),         "(H, W) — doit etre divisible par 64"),
+    ("DEVICE",          str(DEVICE),             "cpu ou cuda"),
+    ("BATCH_SIZE",      str(BATCH_SIZE),         "Nombre d'examens par batch"),
+    ("NUM_EPOCHS",      str(NUM_EPOCHS),         "Passes sur le train set"),
+    ("LEARNING_RATE",   str(LEARNING_RATE),      "Taux d'apprentissage Adam"),
+    ("WEIGHT_DECAY",    str(WEIGHT_DECAY),       "Regularisation L2"),
+    ("VAL_SPLIT",       str(VAL_SPLIT),          "Fraction pour la validation"),
+    ("RANDOM_SEED",     str(RANDOM_SEED),        "Graine de reproductibilite"),
+], columns=["Parametre", "Valeur", "Role"])
+ipy_display(cfg)
+```
+
+## 14. Donnees actuellement chargeables
+
+```{python}
+#| echo: false
+if not os.path.exists(EXAM_LIST_PATH):
+    ipy_display(Markdown(
+        f"> `data.pkl` introuvable : `{_rel(EXAM_LIST_PATH)}`\n\n"
+        f"Lancer le preprocessing : `python scripts/preprocess.py --input-dir <dossier> --output-dir preprocess_image/{RUN_NAME}`"
+    ))
+else:
+    with open(EXAM_LIST_PATH, "rb") as f:
+        exams = pickle.load(f)
+    labels = np.array([int(e["cancer_label"]["malignant"]) for e in exams])
+    n_pos = int(labels.sum())
+    n_tot = len(exams)
+    n_neg = n_tot - n_pos
+    VIEWS = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
+    n_complete = sum(all(len(e.get(v, [])) > 0 for v in VIEWS) for e in exams)
+
+    ratio = f"{n_pos/n_tot*100:.1f}%" if n_tot else "—"
+    ipy_display(Markdown(
+        f"| Metrique | Valeur |\n|---|---|\n"
+        f"| Examens total | {n_tot} |\n"
+        f"| Cancers | {n_pos} ({ratio}) |\n"
+        f"| Sains | {n_neg} |\n"
+        f"| Examens avec les 4 vues completes | {n_complete} |\n"
+    ))
+```
+
+## 15. Cache des features
+
+```{python}
+#| echo: false
+if not os.path.exists(CACHE_PATH):
+    ipy_display(Markdown(
+        f"> Cache absent : `{_rel(CACHE_PATH)}`\n\n"
+        "Lancer : `python -m fine_tuning.features`"
+    ))
+else:
+    cache = torch.load(CACHE_PATH, weights_only=False)
+    f = cache["features"]
+    l = cache["labels"]
+    ipy_display(Markdown(
+        f"| Champ | Valeur |\n|---|---|\n"
+        f"| Chemin | `{_rel(CACHE_PATH)}` |\n"
+        f"| Shape features | `{tuple(f.shape)}` |\n"
+        f"| image_size en cache | `{cache.get('image_size')}` |\n"
+        f"| Labels : cancers / total | {int(l.sum())} / {len(l)} |\n"
+    ))
+```
+
+## 16. Checkpoint entraine
+
+```{python}
+#| echo: false
+if not os.path.exists(BEST_MODEL_PATH):
+    ipy_display(Markdown(
+        f"> Checkpoint absent : `{_rel(BEST_MODEL_PATH)}`\n\n"
+        "Lancer : `python -m fine_tuning.train`"
+    ))
+else:
+    ckpt = torch.load(BEST_MODEL_PATH, weights_only=False)
+    ipy_display(Markdown(
+        f"| Champ | Valeur |\n|---|---|\n"
+        f"| Chemin | `{_rel(BEST_MODEL_PATH)}` |\n"
+        f"| Meilleure epoch | {ckpt.get('epoch', 'n/a')} / {NUM_EPOCHS} |\n"
+        f"| Meilleur AUC-ROC val | {ckpt.get('val_auc', float('nan')):.4f} |\n"
+    ))
+```
+
+## 17. Reproduire depuis zero
+
+```bash
+# 1. Environnement
+conda activate gmic
+
+# 2. Preprocessing des images
+python scripts/preprocess.py \
+    --input-dir <chemin/vers/mes/dicoms/ou/pngs> \
+    --output-dir preprocess_image/mon_run
+
+# 3. Pointer fine_tuning/config.py vers ce run
+#    Ouvrir le fichier et mettre : RUN_NAME = "mon_run"
+
+# 4. Calculer le cache des features (une seule fois)
+python -m fine_tuning.features
+
+# 5. Entrainer la tete
+python -m fine_tuning.train
+```
+
+---
+
+# Pour aller plus loin
+
+Les limites structurelles du feature extraction :
+
+- **Le plafond est fixe par GMIC** : si GMIC ne "voit" pas une lesion,
+  la tete ne pourra pas la detecter. Les 8 features sont tout ce qu'elle
+  recoit.
+- **Peu de flexibilite** : on ne peut pas apprendre de representations
+  specifiques a nos donnees.
+
+Pistes d'amelioration, par ordre de complexite croissante :
+
+1. **Extraire des features plus riches** : au lieu de prendre les 2
+   sorties finales de GMIC, extraire les activations d'une couche
+   intermediaire (typiquement plusieurs centaines de dimensions). La
+   tete recoit plus d'information.
+2. **Partial fine-tuning** : degeler les dernieres couches de GMIC et
+   les entrainer avec un learning rate tres faible.
+3. **Augmentation de donnees plus agressive** : rotations, zoom,
+   brightness, elastic transforms.
+4. **Cross-validation (k-fold ou Leave-One-Out)** : si le dataset est
+   trop petit pour un split train/val fiable, faire tourner l'entrainement
+   K fois sur K splits differents et moyenner les AUC-ROC.
+5. **Augmenter le dataset** : ajouter des donnees publiques annotees
+   (CBIS-DDSM, VinDr-Mammo, RSNA Breast Cancer). C'est souvent le
+   levier le plus efficace.

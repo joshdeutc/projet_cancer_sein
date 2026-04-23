@@ -1,10 +1,10 @@
-# Donnees et sorties (volumineux, ne pas versionner)
+# ─── Données et sorties (volumineux, ne pas versionner) ─────────────────────
 data/*
 !data/.gitkeep
 !data/sample/
 !data/test_images/
-output/*
-!output/.gitkeep
+preprocess_image/*
+!preprocess_image/.gitkeep
 extract_dataset*/
 rsna_images/
 rsna_output/
@@ -13,18 +13,22 @@ cancer_test_output/
 RSNA/
 Test_model_with_cancer/
 
-# PKL orphelins a la racine
+# PKL orphelins à la racine
 *.pkl
 
-# Fichiers generes par Quarto (les rapports HTML de reference sont dans docs/)
+# ─── Fichiers générés par Quarto (rapports de référence dans docs/) ─────────
 script_notebook/*.html
 script_notebook/*.pdf
-pipeline_gmic_files/
+script_notebook/*.ipynb
+script_notebook/*_files/
+README.html
+README_files/
 
-# GMIC modeles (trop lourds pour git, a telecharger separement)
+# ─── Modèles et checkpoints (trop lourds pour git) ──────────────────────────
 GMIC/models/*.p
+fine_tuning/checkpoints/
 
-# Python
+# ─── Python ─────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -33,22 +37,29 @@ __pycache__/
 dist/
 build/
 
-# Environnements
+# ─── Environnements ─────────────────────────────────────────────────────────
 .env
 .env.local
+.paths.mk
+.paths.local.mk
+.venv/
+venv/
 *.kaggle/
 .claude/
 uv.lock
+environment.lock.yml
 
-# IDE
+# ─── IDE / OS ───────────────────────────────────────────────────────────────
 .vscode/
 .idea/
-
-# OS
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
+*.Zone.Identifier
+error.log
 
-# Anciens scripts racine (gardes en local mais pas dans le package)
+# ─── Anciens scripts racine (gardés en local mais pas dans le package) ──────
 /run_gmic_pipeline.py
 /run_gmic_rsna.py
 /run_gmic_pipeline_with_kaggle_notebook.py

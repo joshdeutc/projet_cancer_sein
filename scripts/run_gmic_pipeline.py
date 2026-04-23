@@ -6,7 +6,7 @@ Orchestre les deux etapes du pipeline :
   2) inference.py  (etapes 6-7)
 
 Usage :
-  python scripts/run_gmic_pipeline.py --input-dir data/demo --output-dir output/demo
+  python scripts/run_gmic_pipeline.py --input-dir data/demo --output-dir preprocess_image/demo
   python scripts/run_gmic_pipeline.py --input-dir data/extract_dataset --force-centers
 """
 
@@ -37,7 +37,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples :
-  python scripts/run_gmic_pipeline.py --input-dir data/demo --output-dir output/demo
+  python scripts/run_gmic_pipeline.py --input-dir data/demo --output-dir preprocess_image/demo
   python scripts/run_gmic_pipeline.py --input-dir data/extract_dataset --force-crop
         """,
     )
@@ -46,7 +46,7 @@ Exemples :
     parser.add_argument("--csv", default=None,
                         help="Chemin vers le CSV. Defaut : detecte depuis input-dir")
     parser.add_argument("--output-dir", default=None,
-                        help="Dossier de sortie. Defaut : <projet>/output/")
+                        help="Dossier de sortie. Defaut : <projet>/preprocess_image/")
     parser.add_argument("--format", choices=["dicom", "png", "auto"], default="auto",
                         help="Format des images d'entree (defaut: auto-detection)")
     parser.add_argument("--force-crop", action="store_true",
@@ -64,7 +64,7 @@ Exemples :
         print(f"Erreur : dossier introuvable : {input_dir}")
         sys.exit(1)
 
-    output_dir = os.path.abspath(args.output_dir) if args.output_dir else os.path.join(PROJECT_DIR, "output")
+    output_dir = os.path.abspath(args.output_dir) if args.output_dir else os.path.join(PROJECT_DIR, "preprocess_image")
 
     preprocess_cmd = [
         sys.executable,

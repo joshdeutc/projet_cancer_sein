@@ -10,11 +10,18 @@ import os
 # Dossier racine du projet
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Pkl contenant les exams preprocessés (cropped_exam_list.pkl)
-EXAM_LIST_PATH = os.path.join(PROJECT_ROOT, "data", "extract_dataset", "cropped_exam_list.pkl")
+# Nom du run de preprocessing à utiliser (dossier dans output/)
+# Changer cette ligne pour pointer vers un autre run
+RUN_NAME = "rsna_output"
 
-# Dossier contenant les images PNG : {IMAGE_DIR}/{patient_id}/{image_id}.png
-IMAGE_DIR = os.path.join(PROJECT_ROOT, "data", "extract_dataset", "png_images")
+# Dossier du run — produit par preprocess.py + inference.py
+RUN_DIR = os.path.join(PROJECT_ROOT, "preprocess_image", RUN_NAME)
+
+# data.pkl : liste des exams avec leurs labels et chemins d'images
+EXAM_LIST_PATH = os.path.join(RUN_DIR, "data.pkl")
+
+# cropped_images/ : images uint8 2944×1920 prétraitées par le pipeline
+IMAGE_DIR = os.path.join(RUN_DIR, "cropped_images")
 
 # Dossier où sauvegarder les checkpoints du modèle
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "fine_tuning", "checkpoints")
@@ -40,7 +47,7 @@ IMAGE_SIZE = (1472, 960)   # moitié de la résolution originale
 BATCH_SIZE = 1
 
 # Nombre d'epochs
-NUM_EPOCHS = 20
+NUM_EPOCHS = 50
 
 # Taux d'apprentissage initial
 LEARNING_RATE = 1e-4
@@ -51,5 +58,5 @@ WEIGHT_DECAY = 1e-5
 # Nombre de workers pour le DataLoader (0 = pas de multiprocessing)
 NUM_WORKERS = 2
 
-# Utiliser le GPU si disponible
-DEVICE = "cuda"   # "cpu" pour forcer le CPU
+# Device d'entraînement. "cuda" si GPU disponible, sinon "cpu".
+DEVICE = "cuda"

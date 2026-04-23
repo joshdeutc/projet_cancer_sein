@@ -1,0 +1,3 @@
+[submodule "modules/make-recipes"]
+	path = modules/make-recipes
+	url = https://github.com/Epiconcept-Paris/data-make-recipes.git
