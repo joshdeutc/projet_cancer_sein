@@ -20,8 +20,9 @@ RUN_DIR = os.path.join(PROJECT_ROOT, "preprocess_image", RUN_NAME)
 # data.pkl : liste des exams avec leurs labels et chemins d'images
 EXAM_LIST_PATH = os.path.join(RUN_DIR, "data.pkl")
 
-# cropped_images/ : images uint8 2944×1920 prétraitées par le pipeline
-IMAGE_DIR = os.path.join(RUN_DIR, "cropped_images")
+# cropped_512/ : images uint8 512×512 pré-resizées par scripts/preresize_images.py
+# (fallback sur cropped_images/ 2944×1920 si le cache 512 n'existe pas encore)
+IMAGE_DIR = os.path.join(RUN_DIR, "cropped_512")
 
 # Dossier où sauvegarder les checkpoints du modèle
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "fine_tuning", "checkpoints")
@@ -56,7 +57,7 @@ LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 
 # Nombre de workers pour le DataLoader (0 = pas de multiprocessing)
-NUM_WORKERS = 2
+NUM_WORKERS = 8
 
 # Device d'entraînement. "cuda" si GPU disponible, sinon "cpu".
 DEVICE = "cuda"

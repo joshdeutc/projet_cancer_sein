@@ -40,10 +40,21 @@ from fine_tuning.config import (
     LEARNING_RATE,
     NUM_EPOCHS,
     NUM_WORKERS,
+    PROJECT_ROOT,
     RANDOM_SEED,
+    VAL_SPLIT,
     WEIGHT_DECAY,
 )
 from fine_tuning.dataset import load_and_split
+from fine_tuning.run_metadata import (
+    format_duration,
+    get_git_commit,
+    make_run_dir,
+    write_args_json,
+    write_run_readme,
+)
+
+torch.backends.cudnn.benchmark = True
 
 # ─── Hyperparamètres ResNet ──────────────────────────────────────────────────
 
@@ -57,12 +68,8 @@ LR_PRETRAINED   = 1e-5  # LR par défaut quand on fine-tune depuis ImageNet
 VIEWS = ["L-CC", "L-MLO", "R-CC", "R-MLO"]
 NORMALITE_CSV = Path(__file__).parent.parent / "data" / "rsna_images" / "train_subset.csv"
 
-
-def _make_run_dir(tag: str) -> Path:
-    """Crée un dossier horodaté unique pour ce run."""
-    run_dir = RUNS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{tag}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+TARGET = "normalite"
+DATASET_NAME = "RSNA Breast Cancer Detection (2022, Kaggle)"
 
 
 # ─── Labels normalité : lecture du CSV ───────────────────────────────────────
@@ -81,7 +88,8 @@ def _load_normalite_labels() -> dict[tuple[int, int], int]:
     anormal = (
         (df["cancer"] == 1)
         | (df["biopsy"] == 1)
-        | (df["difficult_negative_case"] == True)  # noqa: E712 (pandas mask)
+        | (df["difficult_negative_case"] == True)
+          | (df["BIRADS"]== 0)  # noqa: E712 (pandas mask)
     )
     df["label"] = anormal.astype(int)
     return {
@@ -214,7 +222,10 @@ def build_resnet18(device: str, pretrained: bool = False) -> nn.Module:
     """Construit ResNet18. `pretrained=True` charge les poids ImageNet (fine-tuning)."""
     weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
     model = models.resnet18(weights=weights)
-    model.fc = nn.Linear(model.fc.in_features, 1)
+    model.fc = nn.Sequential(
+        nn.Dropout(p=0.5),
+        nn.Linear(model.fc.in_features, 1),
+    )
     return model.to(device)
 
 
@@ -233,15 +244,16 @@ def train(
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    # Tag dédié pour distinguer ces runs des runs cancer.
-    tag = "normalite_pretrained" if pretrained else "normalite_scratch"
-    run_dir   = _make_run_dir(tag)
+    # Dossier de run : runs/{target}/{model_tag}/{timestamp}/
+    model_tag = "resnet18_pretrained" if pretrained else "resnet18_scratch"
+    run_dir   = make_run_dir(RUNS_DIR, TARGET, model_tag)
     ckpt_path = run_dir / "best.pt"
     logs_path = run_dir / "logs.json"
     roc_path  = run_dir / "roc.png"
-    args_path = run_dir / "args.json"
     # Le cache des stats reste global (dépend uniquement de img_size).
     stats_path = CHECKPOINT_DIR / f"train_stats_{img_size}.json"
+    t_start = time.time()
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
     # Charge les labels normalité depuis le CSV
     label_lookup = _load_normalite_labels()
@@ -280,6 +292,8 @@ def train(
         sampler=_make_sampler(train_entries),
         num_workers=NUM_WORKERS,
         pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -287,6 +301,8 @@ def train(
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=4 if NUM_WORKERS > 0 else None,
     )
 
     model = build_resnet18(device, pretrained=pretrained)
@@ -307,17 +323,42 @@ def train(
     loss_fn = nn.BCEWithLogitsLoss()
 
     hyperparams = {
-        "target": "normalite",
-        "label_rule": "cancer==1 OR biopsy==1 OR difficult_negative_case==True",
+        # Cible
+        "target": TARGET,
+        "label_rule": "cancer==1 OR biopsy==1 OR difficult_negative_case==True OR BIRADS==0",
         "label_csv": str(NORMALITE_CSV.relative_to(NORMALITE_CSV.parents[2])),
+        # Modèle
+        "model_arch": "resnet18 (torchvision)",
+        "head_desc": "Sequential(Dropout(p=0.5), Linear(512, 1))",
+        "pretrained": pretrained,
+        # Données
+        "dataset_name": DATASET_NAME,
+        "image_dir": str(IMAGE_DIR),
+        "val_split": VAL_SPLIT,
+        "random_seed": RANDOM_SEED,
+        "n_train": len(train_entries), "n_val": len(val_entries),
+        "n_positive_train": n_pos_train, "n_positive_val": n_pos_val,
+        "aggregation": "par image (chaque vue = un échantillon), label lu dans le CSV",
+        # Entraînement
         "epochs": epochs, "batch_size": batch_size, "lr": lr,
         "weight_decay": weight_decay, "img_size": img_size, "device": device,
-        "pretrained": pretrained, "warmup_epochs": warmup_iters,
-        "n_train": len(train_entries), "n_val": len(val_entries),
-        "n_anormal_train": n_pos_train, "n_anormal_val": n_pos_val,
+        "warmup_epochs": warmup_iters, "patience": patience,
         "augmentation": "hflip + affine(rot=10, trans=5%, scale=±5%) + jitter(0.25)",
+        "sampler": "WeightedRandomSampler (équilibre normal / anormal)",
+        "num_workers": NUM_WORKERS,
+        # Contexte
+        "git_commit": get_git_commit(Path(PROJECT_ROOT)),
+        "started_at": started_at,
+        "ended_at": None,
+        "total_time_s": None,
+        "total_time_human": None,
+        "epochs_ran": None,
+        "early_stopped": False,
+        "best_auc": None,
+        "best_epoch": None,
     }
-    args_path.write_text(json.dumps(hyperparams, indent=2))
+    write_args_json(run_dir, hyperparams)
+    write_run_readme(run_dir, hyperparams)
     logs = {"hyperparams": hyperparams, "epochs": []}
 
     best_auc = 0.0
@@ -400,7 +441,20 @@ def train(
         if epochs_since_best >= patience:
             print(f"\nEarly stopping : pas d'amélioration depuis {patience} epochs "
                   f"(best={best_auc:.4f} à epoch {best_epoch}).")
+            hyperparams["early_stopped"] = True
             break
+
+    # — Finalisation des métadonnées (temps total, best, epochs exécutées)
+    total_time_s = time.time() - t_start
+    hyperparams["ended_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    hyperparams["total_time_s"] = round(total_time_s, 1)
+    hyperparams["total_time_human"] = format_duration(total_time_s)
+    hyperparams["epochs_ran"] = len(logs["epochs"])
+    hyperparams["best_auc"] = round(best_auc, 4) if best_auc else None
+    hyperparams["best_epoch"] = best_epoch if best_epoch else None
+    write_args_json(run_dir, hyperparams)
+    write_run_readme(run_dir, hyperparams)
+    logs_path.write_text(json.dumps(logs, indent=2))
 
     print(f"\nMeilleur AUC val : {best_auc:.4f}  (epoch {best_epoch})  →  {ckpt_path}")
 

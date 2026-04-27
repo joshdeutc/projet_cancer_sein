@@ -24,8 +24,10 @@ script_notebook/*_files/
 README.html
 README_files/
 
+# ─── GMIC — projet externe (fork), non versionné ici ───────────────────────
+GMIC/
+
 # ─── Modèles et checkpoints (trop lourds pour git) ──────────────────────────
-GMIC/models/*.p
 fine_tuning/checkpoints/
 
 # ─── Python ─────────────────────────────────────────────────────────────────

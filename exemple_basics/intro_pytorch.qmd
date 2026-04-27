@@ -36,7 +36,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 
@@ -75,19 +75,151 @@ On définit `y = x² + 3x + 2`, on demande à PyTorch de tracer les gradients,
 et on appelle `.backward()`. La dérivée analytique est `dy/dx = 2x + 3`. En
 `x = 4` on attend donc `11`.
 
+### Ce que PyTorch fabrique pendant le forward
+
+Quand tu écris `y = x**2 + 3*x + 2`, PyTorch ne se contente pas de calculer
+un nombre : pour chaque opération, il enregistre aussi *qui* étaient les
+entrées et *comment* remonter la dérivée. Résultat : un **graphe de calcul**
+orienté, où `x` est la racine (une **feuille** : tu l'as créé à la main) et
+`y` est la sortie (un **nœud intermédiaire** : PyTorch l'a fabriqué).
+
+Le diagramme ci-dessous montre les deux passes qui vont se succéder — la
+passe avant (flèches pleines) qui évalue `y`, et la passe arrière (flèches
+pointillées) qui remonte les dérivées à coups de chain rule.
+
+```{mermaid}
+graph LR
+    %% Définition des styles (couleurs)
+    classDef input fill:#e1f5fe,stroke:#03a9f4,stroke-width:2px;
+    classDef operation fill:#fff3e0,stroke:#ff9800,stroke-width:2px;
+    classDef output fill:#e8f5e9,stroke:#4caf50,stroke-width:2px;
+    classDef note fill:#f9f9f9,stroke:#999,stroke-width:1px,stroke-dasharray: 5 5;
+
+    %% Nœuds (Variables et Opérations)
+    X(("x = 4.0<br/>(requires_grad=True)")):::input
+    V1["v1 = x²<br/>(Valeur : 16)"]:::operation
+    V2["v2 = 3 * x<br/>(Valeur : 12)"]:::operation
+    V3["v3 = v1 + v2<br/>(Valeur : 28)"]:::operation
+    Y(("y = v3 + 2<br/>(Valeur : 30)")):::output
+
+    %% FORWARD PASS (Passe avant - Flèches pleines)
+    X -->|x| V1
+    X -->|x| V2
+    V1 -->|v1| V3
+    V2 -->|v2| V3
+    V3 -->|v3| Y
+
+    %% BACKWARD PASS (Passe arrière / Gradients - Flèches pointillées)
+    Y -.->|"dy/dv3 = 1"| V3
+    V3 -.->|"dv3/dv1 = 1"| V1
+    V3 -.->|"dv3/dv2 = 1"| V2
+
+    %% Retour aux sources (Calcul de la dérivée par rapport à x)
+    V1 -.->|"dv1/dx = 2x = 8"| X
+    V2 -.->|"dv2/dx = 3"| X
+
+    %% Note finale pour expliquer le résultat
+    NoteFinal["Gradient final (x.grad) :<br/> 8 + 3 = 11"]:::note
+    X --- NoteFinal
+```
+
+**Pourquoi `x.grad` et pas `y.grad` ?** PyTorch ne stocke par défaut le
+gradient que sur les **feuilles** (tenseurs créés par toi avec
+`requires_grad=True`). `y` est un intermédiaire : son `.grad` reste `None`.
+Si tu veux forcer la conservation, tu peux appeler `y.retain_grad()` avant
+le backward — mais en pratique on n'a besoin que des gradients des
+paramètres (les poids du réseau), qui sont justement des feuilles.
+
+**Pourquoi un `.backward()` sur un scalaire ?** PyTorch ne sait dériver que
+des scalaires par rapport à des tenseurs. Si `y` était un vecteur, il
+faudrait dire par rapport à quelle combinaison linéaire tu dérives (argument
+`grad_tensors=...`). C'est pour ça que, dans un entraînement, on fait
+toujours `loss.backward()` sur une loss réduite à un seul nombre.
+
+### Cycle de vie du graphe de calcul
+
+Le graphe intermédiaire n'est pas gratuit : pour un gros modèle, il peut
+peser plusieurs GB dans la RAM du GPU. PyTorch **le détruit par défaut
+après chaque `.backward()`** pour libérer la mémoire. Conséquence : un
+deuxième `.backward()` sur le même `y` plantera, sauf si tu as passé
+`retain_graph=True`. Le schéma suivant résume les trois phases.
+
+```{mermaid}
+graph TD
+    %% Styles minimalistes
+    classDef leaf fill:#e3f2fd,stroke:#2196f3,stroke-width:2px;
+    classDef temp fill:#f5f5f5,stroke:#999,stroke-width:2px,stroke-dasharray: 4 4;
+    classDef output fill:#e8f5e9,stroke:#4caf50,stroke-width:2px;
+    classDef dead fill:#ffcdd2,stroke:#f44336,stroke-width:2px;
+
+    subgraph Etape1 ["1. Passe Avant (y = x² + 3x + 2)"]
+        direction LR
+        X1("x"):::leaf -->|Alloue| T1("Variables Temporaires C++<br/>(invisibles en Python)"):::temp
+        T1 -->|Alloue| Y1("y"):::output
+    end
+
+    subgraph Etape2 ["2. Passe Arrière (y.backward)"]
+        direction RL
+        Y2("y"):::output -.->|Calcule le gradient| T2("Variables Temporaires C++<br/>(DÉTRUITES APRÈS LECTURE)"):::dead
+        T2 -.->|Calcule le gradient| X2("x.grad"):::leaf
+    end
+
+    subgraph Etape3 ["3. Après Exécution"]
+        direction LR
+        X3("x (et son gradient)"):::leaf
+        Vide("Le graphe C++ a été purgé de la RAM"):::temp
+        Y3("y"):::output
+
+        X3 ~~~ Vide ~~~ Y3
+    end
+
+    Etape1 ==> Etape2 ==> Etape3
+```
+
+Au terme de ce cycle : la feuille `x` a un `.grad` rempli, les temporaires
+sont libérés, et `y` n'a toujours pas de gradient associé.
+
 ```{python}
 x = torch.tensor(4.0, requires_grad=True)
 y = x ** 2 + 3 * x + 2
+print("Avant backward :", x.grad)         # None — le graphe existe mais pas encore de gradient
 y.backward()
-print(f"y = {y.item()}")
-print(f"dy/dx en x=4 (calculé par PyTorch) : {x.grad.item()}")
-print(f"dy/dx en x=4 (2x + 3, vérité)       : {2*4 + 3}")
+print(f"y = {y.item()}")                   # 30.0 (la valeur forward)
+print(f"y.grad            : {y.grad}")    # None — y n'est pas une feuille
+print(f"x.grad            : {x.grad.item()}")  # 11.0 — PyTorch a rempli le gradient de la feuille
+print(f"2x + 3 (analytique) : {2*4 + 3}")
+```
+
+### Les gradients s'**accumulent**
+
+C'est le piège classique de débutant : `.grad` ne s'écrase pas, il
+s'additionne à chaque `.backward()`. Si tu appelles deux fois `backward`
+sans remettre à zéro, tu as la somme des deux dérivées dans `x.grad`.
+D'où l'obligation d'appeler `optimizer.zero_grad()` (ou `x.grad.zero_()`)
+au début de chaque itération d'entraînement.
+
+```{python}
+x = torch.tensor(4.0, requires_grad=True)
+
+y1 = x ** 2 + 3 * x + 2          # dy1/dx = 2x + 3 = 11
+y1.backward()
+print(f"après y1.backward : x.grad = {x.grad.item()}")   # 11
+
+y2 = x ** 2                       # dy2/dx = 2x      = 8
+y2.backward()
+print(f"après y2.backward : x.grad = {x.grad.item()}")   # 19 = 11 + 8 (accumulation)
+
+x.grad.zero_()                    # on remet le compteur à zéro
+y3 = 5 * x
+y3.backward()
+print(f"après zero_() + y3 : x.grad = {x.grad.item()}")  # 5
 ```
 
 C'est exactement ce mécanisme qui permet à l'entraînement d'un réseau de
 neurones de fonctionner : on calcule la loss, on fait `loss.backward()`, et
 PyTorch dépose dans chaque paramètre son gradient — prêt à être utilisé par
-l'optimiseur.
+l'optimiseur, qui appellera ensuite `optimizer.zero_grad()` pour préparer
+l'itération suivante.
 
 ---
 
@@ -120,6 +252,73 @@ print("Paramètres :", list(net.parameters()))
 `b`, initialisés aléatoirement. Dès qu'on appellera `net.parameters()` dans un
 optimiseur, ces deux valeurs seront ajustées par la descente de gradient.
 
+## Entraîner `MiniLinear` à apprendre `y = 2x + 1`
+
+Pour passer de "un module qui existe" à "un module qui a appris quelque
+chose", il faut l'assembler avec les trois autres briques qu'on vient de
+voir : **des données**, **une loss** (= à quel point on se trompe), et
+**un optimiseur** (= qui met à jour les poids à partir du gradient).
+
+On fabrique 20 points bruités sur la vraie droite `y = 2x + 1`, et on
+demande au réseau de retrouver les coefficients.
+
+```{python}
+# 1. Données synthétiques : y_true = 2x + 1 + bruit gaussien
+torch.manual_seed(0)
+X = torch.linspace(-3, 3, 20).unsqueeze(1)        # shape (20, 1)
+y_true = 2 * X + 1 + 0.3 * torch.randn_like(X)    # bruit d'écart-type 0.3
+
+# 2. Le réseau, la loss et l'optimiseur
+net = MiniLinear()
+loss_fn = nn.MSELoss()                            # erreur quadratique moyenne
+optimizer = torch.optim.SGD(net.parameters(), lr=0.05)
+
+# 3. La boucle d'entraînement — les 5 lignes canoniques de PyTorch
+losses = []
+for step in range(200):
+    y_pred = net(X)                               # (1) forward : prédiction
+    loss = loss_fn(y_pred, y_true)                # (2) comparer à la vérité
+    optimizer.zero_grad()                         # (3) reset gradients (sinon accumulation)
+    loss.backward()                               # (4) rétro-propagation
+    optimizer.step()                              # (5) mise à jour w et b
+    losses.append(loss.item())
+    if step % 40 == 0:
+        print(f"step {step:3d}  loss = {loss.item():.4f}")
+
+# 4. Ce qu'il a appris
+w = net.linear.weight.item()
+b = net.linear.bias.item()
+print(f"\nAppris : y ≈ {w:.3f} * x + {b:.3f}")
+print(f"Vérité : y = 2.000 * x + 1.000")
+```
+
+Visualisation : la courbe de loss descend (preuve que l'apprentissage
+fonctionne), et la droite apprise colle aux données.
+
+```{python}
+fig, ax = plt.subplots(1, 2, figsize=(10, 3.5))
+
+ax[0].plot(losses); ax[0].set_yscale("log")
+ax[0].set_title("Loss (échelle log)"); ax[0].set_xlabel("itération")
+
+ax[1].scatter(X.numpy(), y_true.numpy(), label="données bruitées", alpha=0.7)
+x_line = torch.linspace(-3, 3, 100).unsqueeze(1)
+with torch.no_grad():
+    y_line = net(x_line)
+ax[1].plot(x_line.numpy(), y_line.numpy(), "r-", lw=2, label=f"appris : y ≈ {w:.2f}x + {b:.2f}")
+ax[1].plot(x_line.numpy(), (2 * x_line + 1).numpy(), "k--", alpha=0.5, label="vérité : y = 2x + 1")
+ax[1].legend(); ax[1].set_title("Régression apprise")
+
+plt.tight_layout(); plt.show()
+```
+
+Ce micro-entraînement est **la même boucle** qu'on utilisera pour
+CIFAR-10 en Partie VI, qu'on utilise pour ResNet-18 en Partie VIII, et
+qu'on utilise dans `fine_tuning/train_resnet.py` sur les mammographies
+RSNA. Seuls changent : l'architecture du `nn.Module`, la loss, et la
+source de données. Le squelette **forward → loss → zero_grad → backward →
+step** est invariant.
+
 ---
 
 # Partie III — `nn.Conv2d`, la brique des CNN
@@ -142,6 +341,26 @@ CIFAR-10 (on reviendra sur le dataset en Partie IV) et on lui applique quatre
 - **Sobel Y** — dérivée verticale, allume les bords horizontaux
 - **Laplacien** — somme des dérivées secondes, allume tous les contours
 - **Moyenneur 3×3** — lisse l'image (flou)
+
+Le code ci-dessous utilise trois idiomes PyTorch qu'il vaut mieux décoder
+**avant** de le lire :
+
+- `conv.weight.copy_(k.view(1, 1, 3, 3))` — les méthodes qui finissent par
+  un **underscore** (`copy_`, `zero_`, `add_`, …) sont **in-place** : elles
+  modifient le tenseur au lieu d'en créer un nouveau. Ici, on écrase les
+  poids aléatoires initiaux du `Conv2d` par notre filtre codé à la main.
+- `.view(1, 1, 3, 3)` — reshape sans copie, ça change seulement
+  l'interprétation des 9 valeurs : le filtre 3×3 doit avoir la shape
+  `(out_channels, in_channels, H, W)` attendue par `Conv2d`, soit
+  `(1, 1, 3, 3)`.
+- `with torch.no_grad():` — demande à PyTorch de **ne pas tracer** ce qui
+  se passe dans le bloc. Obligatoire quand on modifie des poids en
+  in-place : sinon autograd te jette une erreur "a leaf Variable that
+  requires grad is being used in an in-place operation".
+- `bias=False` dans le `Conv2d` — on ne veut pas qu'un biais appris décale
+  le résultat de nos filtres théoriques (Sobel, Laplacien…).
+- `.detach()` — casse le lien avec le graphe de calcul, pour extraire les
+  valeurs sans risque d'effet de bord sur un futur `.backward()`.
 
 ```{python}
 CIFAR_ROOT = os.path.expanduser("~/.cache/cifar10")
@@ -226,11 +445,92 @@ for (k, s, p) in [(3, 1, 1), (3, 2, 1), (5, 1, 0), (7, 2, 3)]:
 
 ---
 
-# Partie IV — CIFAR-10 et le `DataLoader`
+# Partie IV — CIFAR-10 et le pipeline de données
 
 CIFAR-10 = 60 000 images 32×32 en couleur, 10 classes (avion, voiture, chat…).
-`torchvision` la télécharge automatiquement, et un `DataLoader` nous la sert
-par **mini-batches**.
+`torchvision` la télécharge automatiquement. Mais avant de la donner au
+réseau, on passe par trois briques que PyTorch impose pour **tout** projet
+d'entraînement : `transforms`, `Dataset`, `DataLoader`. Chacune fait une
+seule chose — bien comprendre leur rôle respectif t'évite des heures de
+débug plus tard.
+
+## Les trois briques du pipeline
+
+| Brique | Rôle | Ce qu'on lui donne | Ce qu'elle produit |
+|:---|:---|:---|:---|
+| `transforms` | **transformer** une image | un `PIL.Image` ou un tenseur | un tenseur prêt pour le réseau |
+| `Dataset` | **exposer** les échantillons un par un | un index `i` | `(x_i, y_i)` |
+| `DataLoader` | **batcher + paralléliser** | un `Dataset` | une séquence de batches `(xs, ys)` |
+
+### `transforms` — le pipeline par image
+
+`transforms.Compose([...])` est une file d'opérations appliquée séquentiellement
+à chaque image, au moment où on la lit. Les deux qu'on utilise :
+
+- `transforms.ToTensor()` convertit un `PIL.Image` (uint8, valeurs 0–255)
+  en tenseur `torch.float32` normalisé dans [0, 1], avec la convention
+  **(channels, height, width)** de PyTorch — différente de **(H, W, C)**
+  qu'attend `matplotlib`.
+- `transforms.Normalize(mean, std)` applique `(x - mean) / std` canal par
+  canal. Ici `mean = std = (0.5, 0.5, 0.5)` donc on mappe [0, 1] → [-1, 1].
+  **Pourquoi ?** Un réseau converge beaucoup plus vite quand ses entrées
+  sont centrées autour de 0 et d'échelle ~1 : les gradients ne sont pas
+  biaisés vers une direction, les activations ne saturent pas, l'optimiseur
+  avance droit. Pour les modèles pré-entraînés ImageNet (comme ResNet-18
+  en Partie VIII), on est forcé d'utiliser les stats spécifiques
+  `mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]` — sinon les poids
+  appris sur ImageNet ne savent plus quoi faire des entrées.
+
+Tu peux empiler plus d'étapes (augmentation aléatoire : `RandomHorizontalFlip`,
+`RandomCrop`, `ColorJitter`…). On en verra en Partie VIII.
+
+### `Dataset` — l'interface minimale
+
+Un `Dataset` PyTorch, c'est une classe qui répond à **deux questions** :
+"combien d'échantillons ?" (`__len__`) et "donne-moi l'échantillon numéro
+i" (`__getitem__`). C'est tout.
+
+```{python}
+class MyDataset(Dataset):
+    def __init__(self, xs, ys):
+        self.xs, self.ys = xs, ys            # deux listes de même longueur
+    def __len__(self):
+        return len(self.xs)
+    def __getitem__(self, i):
+        return self.xs[i], self.ys[i]        # PyTorch ne demande rien de plus
+
+# Exemple minuscule — en pratique __getitem__ fait souvent de l'I/O (open + decode)
+tiny = MyDataset([torch.randn(3) for _ in range(4)], [0, 1, 1, 0])
+print("len :", len(tiny))
+print("item 2 :", tiny[2])
+```
+
+`datasets.CIFAR10` est exactement ça en plus grand : son `__getitem__(i)`
+lit la i-ème image du binaire CIFAR, lui applique `transform`, et renvoie
+`(tenseur_image, label_int)`.
+
+### `DataLoader` — le gestionnaire de batches
+
+Un `Dataset` te donne les échantillons un par un. Mais un GPU traite plus
+vite 128 images d'un coup que 128 fois 1 image. Et chaque appel à
+`__getitem__` coûte du temps (ouverture disque + decode + transforms). Le
+`DataLoader` résout les deux problèmes en même temps :
+
+1. **Shuffle** — mélange les indices au début de chaque epoch (`shuffle=True`)
+   pour éviter que le réseau mémorise l'ordre des données.
+2. **Batching** — regroupe `batch_size` échantillons en un tenseur empilé
+   de shape `(batch_size, ...)`. C'est le **collate** : par défaut il empile
+   avec `torch.stack`, tu peux fournir une fonction custom si besoin.
+3. **Parallélisation** — avec `num_workers=N`, il lance N sous-processus
+   qui pré-calculent les prochains batches pendant que le GPU bosse sur
+   celui en cours. Gain majeur quand le `__getitem__` est lourd (décodage
+   JPEG, resize, augmentation) — c'est exactement ce qu'on a mis en place
+   dans `fine_tuning/train_resnet.py` avec `NUM_WORKERS=8`.
+4. **`pin_memory=True`** — les batches sont alloués dans une zone RAM
+   "pinned", transférable au GPU en une seule DMA au lieu de copies
+   intermédiaires. Gratuit, toujours activer sur CUDA.
+
+Une fois tout ça câblé, on écrit juste `for x, y in loader: ...`.
 
 ```{python}
 CIFAR_ROOT = os.path.expanduser("~/.cache/cifar10")
@@ -238,7 +538,7 @@ CIFAR_ROOT = os.path.expanduser("~/.cache/cifar10")
 transform = transforms.Compose([
     transforms.ToTensor(),                          # [0, 255] -> [0, 1], (3, 32, 32)
     transforms.Normalize((0.5, 0.5, 0.5),
-                         (0.5, 0.5, 0.5)),          # centre les valeurs sur ~0
+                         (0.5, 0.5, 0.5)),          # (x - 0.5) / 0.5 → [-1, 1]
 ])
 
 train_full = datasets.CIFAR10(root=CIFAR_ROOT, train=True,  transform=transform, download=True)
@@ -257,16 +557,18 @@ print(f"Train subset : {len(train_ds)} images  |  Test subset : {len(test_ds)} i
 
 # Aperçu
 imgs, labels = next(iter(train_loader))
+print(f"Shape d'un batch : {imgs.shape}  (N, C, H, W)")
 fig, axes = plt.subplots(1, 8, figsize=(12, 2))
 for i, ax in enumerate(axes):
-    img = imgs[i].permute(1, 2, 0).numpy() * 0.5 + 0.5   # dé-normalisation
+    img = imgs[i].permute(1, 2, 0).numpy() * 0.5 + 0.5   # dé-normalisation pour affichage
     ax.imshow(img); ax.set_title(classes[labels[i]], fontsize=9); ax.axis("off")
 plt.tight_layout(); plt.show()
 ```
 
-Un `DataLoader` ne charge pas tout en mémoire : il pioche par batch, mélange
-(`shuffle=True`) pour éviter que le réseau mémorise l'ordre, et peut utiliser
-plusieurs workers en parallèle.
+Note la dé-normalisation `* 0.5 + 0.5` pour l'affichage : `matplotlib`
+veut des pixels dans [0, 1], alors que `Normalize` nous a mis dans [-1, 1].
+C'est typique — le pipeline d'affichage est l'inverse du pipeline
+d'entraînement.
 
 ---
 
@@ -310,21 +612,6 @@ n_params = sum(p.numel() for p in model.parameters())
 print(f"\nParamètres totaux : {n_params:,}  ({n_params/1e6:.2f} M)")
 ```
 
-## Vérifier les shapes à la main
-
-On fait passer une image fictive et on imprime la shape à chaque étage.
-Si un nombre ne colle pas avec `fc1`, la boucle d'entraînement plantera
-sur le `view` — c'est l'erreur la plus courante en PyTorch.
-
-```{python}
-dummy = torch.randn(1, 3, 32, 32).to(DEVICE)
-h = model.pool(F.relu(model.bn1(model.conv1(dummy))));  print("après bloc 1 :", tuple(h.shape))
-h = model.pool(F.relu(model.bn2(model.conv2(h))));      print("après bloc 2 :", tuple(h.shape))
-h = h.view(h.size(0), -1);                               print("après flatten :", tuple(h.shape))
-h = F.relu(model.fc1(h));                                print("après fc1   :", tuple(h.shape))
-h = model.fc2(h);                                        print("après fc2   :", tuple(h.shape))
-```
-
 ---
 
 # Partie VI — La boucle d'entraînement
@@ -342,6 +629,22 @@ optimizer.zero_grad()         # (5) remettre à zéro pour le prochain batch
 
 Et c'est tout. On l'emballe dans deux boucles imbriquées : une sur les
 **époques** (passes complètes sur le dataset), une sur les **batches**.
+
+**À propos de `criterion`** : ce n'est pas un mot-clé PyTorch, juste une
+convention de nommage pour "la fonction qu'on utilise pour mesurer
+l'erreur" (= la loss). On aurait pu l'appeler `loss_fn`, certains codes
+le font. `nn.CrossEntropyLoss()` est un `nn.Module` (comme notre `MiniLinear`
+de la Partie II) : on l'instancie une fois, puis on l'appelle comme une
+fonction à chaque batch avec `criterion(pred, y)`.
+
+Détail important : `CrossEntropyLoss` attend les **logits** (les sorties
+brutes du réseau, avant softmax) et **pas** les probabilités. Elle applique
+`LogSoftmax + NLLLoss` en interne, de manière numériquement stable. C'est
+pour ça que dans le `forward` de `SmallCNN` on renvoie `self.fc2(x)` sans
+activation finale. Autres cas fréquents :
+
+- Classification binaire → `nn.BCEWithLogitsLoss()` (logits + sigmoid interne)
+- Régression → `nn.MSELoss()` (comme en Partie II pour `MiniLinear`)
 
 ```{python}
 def train_one_epoch(model, loader, optimizer, criterion, device):

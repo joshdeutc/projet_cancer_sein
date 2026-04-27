@@ -183,20 +183,24 @@ def build_exam_pkl(csv_path: str, png_dir: str, pkl_path: str) -> list:
                 patients[pid]["cancer_label"]["benign"] = 1
                 patients[pid]["cancer_label"][f"{side}_benign"] = 1
 
-    exam_list = list(patients.values())
+    VIEWS = ("L-CC", "L-MLO", "R-CC", "R-MLO")
+    exam_list = [e for e in patients.values() if any(e[v] for v in VIEWS)]
+    dropped = len(patients) - len(exam_list)
 
     with open(pkl_path, "wb") as f:
         pickle.dump(exam_list, f)
 
     cancer_count = sum(1 for e in exam_list if e["cancer_label"]["malignant"])
     print(f"Examens : {len(exam_list)} total | {cancer_count} cancer | {len(exam_list)-cancer_count} sains")
+    if dropped > 0:
+        print(f"Patients fantomes ignores (aucune image locale) : {dropped}")
     print(f"PKL sauvegarde : {pkl_path}")
     return exam_list
 
 
 # ── Étape 3 : Crop ───────────────────────────────────────────────────────────
 
-def run_crop(png_dir: str, cropped_dir: str, pkl_raw: str, pkl_cropped: str):
+def run_crop(png_dir: str, cropped_dir: str, pkl_raw: str, pkl_cropped: str, num_processes: int = 4):
     print("\n" + "=" * 60)
     print("ETAPE 3 : Recadrage (crop_mammogram)")
     print("=" * 60)
@@ -220,7 +224,7 @@ def run_crop(png_dir: str, cropped_dir: str, pkl_raw: str, pkl_cropped: str):
         f"--output-data-folder {cropped_dir} "
         f"--exam-list-path {pkl_raw} "
         f"--cropped-exam-list-path {pkl_cropped} "
-        f"--num-processes 4"
+        f"--num-processes {num_processes}"
     )
 
     import subprocess
@@ -504,6 +508,8 @@ Exemples :
                         help="Forcer le crop meme s'il semble deja fait")
     parser.add_argument("--force-resize", action="store_true",
                         help="Forcer le resize meme s'il semble deja fait")
+    parser.add_argument("--num-processes", type=int, default=4,
+                        help="Nombre de processes pour crop_mammogram (defaut: 4)")
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input_dir)
@@ -564,12 +570,15 @@ Exemples :
         marker = os.path.join(output_dir, _FLIP_MARKER)
         if os.path.exists(marker):
             os.remove(marker)
-        run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped)
+        # data.pkl doit aussi être régénéré — sinon il reste l'ancien avec une liste de patients périmée
+        if os.path.exists(pkl_final):
+            os.remove(pkl_final)
+        run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped, num_processes=args.num_processes)
     elif is_crop_done(cropped_dir, pkl_cropped):
         n = _count_pngs(cropped_dir)
         print(f"\n[AUTO] Crop : {n} images deja croppees -> SKIP")
     else:
-        run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped)
+        run_crop(source_png_dir, cropped_dir, pkl_raw, pkl_cropped, num_processes=args.num_processes)
 
     if args.force_resize:
         # Resize en place : l'orientation des images ne change pas.
